@@ -291,7 +291,14 @@ def infer_approver_name_from_text(text: str) -> str:
 
 
 def textract_extract(file_bytes: bytes, filename: str) -> Dict[str, Any]:
-    client = boto3.client("textract", region_name=os.getenv("AWS_REGION", "us-east-1"))
+    cfg = get_runtime_aws_config()
+    client_kwargs: Dict[str, Any] = {"region_name": cfg["aws_region"]}
+    if cfg.get("aws_access_key_id") and cfg.get("aws_secret_access_key"):
+        client_kwargs["aws_access_key_id"] = cfg["aws_access_key_id"]
+        client_kwargs["aws_secret_access_key"] = cfg["aws_secret_access_key"]
+        if cfg.get("aws_session_token"):
+            client_kwargs["aws_session_token"] = cfg["aws_session_token"]
+    client = boto3.client("textract", **client_kwargs)
     resp = client.analyze_document(Document={"Bytes": file_bytes}, FeatureTypes=["FORMS", "TABLES"])
     lines = [b.get("Text", "") for b in resp.get("Blocks", []) if b.get("BlockType") == "LINE"]
     return {"raw": resp, "text": "\n".join(lines), "filename": filename}
@@ -437,12 +444,21 @@ def build_confidence_breakdown(textract_raw: Dict[str, Any], normalized: Dict[st
 
 
 def normalize_with_bedrock(text: str, hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    model_id = os.getenv("BEDROCK_MODEL_ID")
+    cfg = get_runtime_aws_config()
+    model_id = cfg["bedrock_model_id"]
     if not model_id:
         raise ValueError("BEDROCK_MODEL_ID missing. Set it in .env")
+    client_kwargs: Dict[str, Any] = {"region_name": cfg["aws_region"]}
+    if cfg.get("aws_access_key_id") and cfg.get("aws_secret_access_key"):
+        client_kwargs["aws_access_key_id"] = cfg["aws_access_key_id"]
+        client_kwargs["aws_secret_access_key"] = cfg["aws_secret_access_key"]
+        if cfg.get("aws_session_token"):
+            client_kwargs["aws_session_token"] = cfg["aws_session_token"]
+    bedrock_runtime_client = boto3.client("bedrock-runtime", **client_kwargs)
     llm = ChatBedrock(
         model_id=model_id,
-        region_name=os.getenv("AWS_REGION", "us-east-1"),
+        region_name=cfg["aws_region"],
+        client=bedrock_runtime_client,
         model_kwargs={"temperature": 0},
     )
     hints = hints or {}
@@ -1390,9 +1406,10 @@ def postprocess_normalized(normalized: Dict[str, Any], ocr_text: str) -> Dict[st
 
 
 def extract_and_normalize(file_bytes: bytes, filename: str, hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    runtime_cfg = get_runtime_aws_config()
     meta = {
-        "aws_region": os.getenv("AWS_REGION", "us-east-1"),
-        "model_id": os.getenv("BEDROCK_MODEL_ID", ""),
+        "aws_region": runtime_cfg["aws_region"],
+        "model_id": runtime_cfg["bedrock_model_id"],
         "textract_used": False,
         "llm_used": False,
         "prevalidation": {},
@@ -1808,6 +1825,49 @@ def save_setting_int(key: str, value: int) -> None:
     conn.close()
 
 
+def get_setting_text(key: str, default: str = "") -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute("select value from app_settings where key=?", (key,)).fetchone()
+        conn.close()
+        if not row or row[0] is None:
+            return default
+        return str(row[0])
+    except sqlite3.Error:
+        return default
+
+
+def save_setting_text(key: str, value: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        insert into app_settings(key, value)
+        values(?, ?)
+        on conflict(key) do update set value=excluded.value
+        """,
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_runtime_aws_config() -> Dict[str, str]:
+    aws_region = (get_setting_text("aws_region", "").strip() or os.getenv("AWS_REGION", "us-east-1")).strip()
+    bedrock_model_id = (get_setting_text("bedrock_model_id", "").strip() or os.getenv("BEDROCK_MODEL_ID", "")).strip()
+    aws_access_key_id = (get_setting_text("aws_access_key_id", "").strip() or os.getenv("AWS_ACCESS_KEY_ID", "")).strip()
+    aws_secret_access_key = (
+        get_setting_text("aws_secret_access_key", "").strip() or os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    ).strip()
+    aws_session_token = (get_setting_text("aws_session_token", "").strip() or os.getenv("AWS_SESSION_TOKEN", "")).strip()
+    return {
+        "aws_region": aws_region,
+        "bedrock_model_id": bedrock_model_id,
+        "aws_access_key_id": aws_access_key_id,
+        "aws_secret_access_key": aws_secret_access_key,
+        "aws_session_token": aws_session_token,
+    }
+
+
 def log_history(
     employee_name: str,
     streak_value: int,
@@ -2152,6 +2212,58 @@ def main() -> None:
             f"Current value: {APP_CONFIG['trusted_streak_threshold']} "
             f"(max 6). This controls trusted auto-approval behavior."
         )
+
+        st.divider()
+        st.subheader("AWS Runtime Configuration")
+        st.caption(
+            "Optional: Save AWS credentials/region/model here. If blank, app falls back to environment/.env values."
+        )
+        runtime_cfg = get_runtime_aws_config()
+        aws_region_value = st.text_input("AWS Region", value=runtime_cfg.get("aws_region", "us-east-1"), key="set_aws_region")
+        bedrock_model_value = st.text_input(
+            "Bedrock Model ID",
+            value=runtime_cfg.get("bedrock_model_id", ""),
+            key="set_bedrock_model_id",
+        )
+        st.caption("Enter credentials only when needed. Leave secret fields blank to keep current saved values.")
+        aws_access_key_input = st.text_input(
+            "AWS Access Key ID",
+            value="",
+            type="password",
+            key="set_aws_access_key_id",
+            placeholder="Leave blank to keep existing",
+        )
+        aws_secret_key_input = st.text_input(
+            "AWS Secret Access Key",
+            value="",
+            type="password",
+            key="set_aws_secret_access_key",
+            placeholder="Leave blank to keep existing",
+        )
+        aws_session_token_input = st.text_input(
+            "AWS Session Token (optional)",
+            value="",
+            type="password",
+            key="set_aws_session_token",
+            placeholder="Leave blank to keep existing",
+        )
+
+        if st.button("Save AWS Configuration"):
+            save_setting_text("aws_region", (aws_region_value or "").strip())
+            save_setting_text("bedrock_model_id", (bedrock_model_value or "").strip())
+            if (aws_access_key_input or "").strip():
+                save_setting_text("aws_access_key_id", aws_access_key_input.strip())
+            if (aws_secret_key_input or "").strip():
+                save_setting_text("aws_secret_access_key", aws_secret_key_input.strip())
+            if (aws_session_token_input or "").strip():
+                save_setting_text("aws_session_token", aws_session_token_input.strip())
+            st.success("AWS configuration saved.")
+
+        if st.button("Clear Saved AWS Credentials"):
+            save_setting_text("aws_access_key_id", "")
+            save_setting_text("aws_secret_access_key", "")
+            save_setting_text("aws_session_token", "")
+            st.success("Saved AWS credentials cleared. Environment/.env fallback will be used.")
         return
 
     if "validation_result" not in st.session_state:
