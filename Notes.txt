@@ -1,0 +1,37 @@
+What it is
+A Streamlit app that compares what the user enters in Step 1 (name, vendor, company, duration, dates, day-wise hours) with what’s read from an uploaded timesheet PDF/image. It then auto-approves, sends to manual review, or auto-approves on trust after repeated manual approvals for the same pattern.
+
+Pipeline (high level)
+
+Pre-checks – file type, readable PDF/image, password-protected PDFs → failures go to manual review with clear messages.
+Image quality (images only) – rough checks for blur/low resolution/weird aspect ratio → flagged to manual review.
+Extraction – OCR-style text + structure from the document, then an LLM normalizes it into a fixed JSON (fields + day_hours + approved marker + confidence hints).
+Compare – field-by-field and day-wise hours vs Step 1 (with tolerance); also checks that an approval/signature line isn’t empty.
+Decide –
+All match → auto-approve
+Mismatch/low confidence/quality/pre-check issues → manual review
+Same employee + vendor + company + template fingerprint + hour pattern, and enough prior manual approvals (configurable threshold, 1–6) → trusted auto-approve on the next matching submission
+Data
+SQLite stores validation history, manual streaks per pattern, and settings (e.g. trusted threshold). Optional duplicate submission blocking uses a hash of Step 1 + file fingerprint.
+
+UX
+Manual vs auto-fill entry modes; Step 2 processes the same or a new file; collapsible pipeline/decision details; friendly errors for bad uploads.
+
+=============
+
+Use this short stack-oriented explanation:
+
+Language: Python
+Framework/UI: Streamlit (single-page workflow app)
+Cloud AI/OCR: AWS services via SDK (boto3)
+OCR + table/form extraction: Amazon Textract
+LLM normalization/field extraction: Amazon Bedrock (through langchain-aws)
+LLM orchestration: LangChain (langchain, langchain-aws)
+Storage: SQLite (sqlite3) for history, streak tracking, settings
+Document/Image utilities:
+pypdf for PDF pre-checks (password/corruption)
+Pillow for image readability/quality checks
+Config handling: python-dotenv for env-based AWS/model settings
+One-liner you can say:
+
+“It’s a Python + Streamlit app using Textract for OCR, Bedrock LLM via LangChain for normalization, and SQLite for audit/streak logic with configurable trusted auto-approval.”

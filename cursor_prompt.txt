@@ -1,0 +1,127 @@
+You are a senior full-stack engineer and solution architect.
+Build a production-ready POC for “Zero-Touch Timesheet Approval” and integrate it into an existing Timesheet UI (same style/placement as timesheet_template screenshot).
+
+## Goal
+Create a 2-step workflow:
+- Step 1: User enters structured timesheet details.
+- Step 2: User uploads timesheet PDF/image; system extracts and validates against Step 1.
+If all checks pass → auto-approve.
+If mismatches/low confidence → manual review.
+Add a trust-based rule: if same case is manually approved 5 times (without corrections), 6th should auto-approve and keep full audit history.
+
+## Functional Requirements
+
+### Step 1 – Form Entry
+Capture:
+- Name (employee)
+- Vendor
+- Company
+- Time Duration: Weekly / Bi-Weekly / Monthly
+- Timesheet period start & end dates
+- Date-wise hours input (e.g., 8, 7, etc.) for each date in selected period
+- Optional totals preview
+
+Validation:
+- Required fields
+- Numeric hour format (0–24, allow decimal)
+- Period/date consistency with selected duration
+
+### Step 2 – Upload + Extract + Validate
+Upload support:
+- PDF, PNG, JPG/JPEG (POC minimum)
+- Single/multi-page PDFs
+- File size/page limits
+- Detect invalid/corrupted/password-protected files
+
+Extraction pipeline:
+- Use LangChain orchestration
+- Use AWS Bedrock LLM for normalization + validation reasoning
+- For OCR/table extraction prefer Amazon Textract for PDF/images
+- Parse:
+  - Employee name
+  - Vendor/client/company
+  - Period dates
+  - Day-wise hour table
+  - Total hours / classification where available
+- Return field-level confidence and raw extraction payload
+
+Comparison engine (Step1 vs uploaded doc):
+- Exact/normalized matching for name/vendor/company
+- Date period match
+- Day-wise hour comparison
+- Totals comparison
+- Tolerance rule: ±0.01 for hour values
+- Config-driven critical vs non-critical fields
+
+Decision engine:
+- AUTO_APPROVE if:
+  - critical fields match
+  - hours match within tolerance
+  - confidence thresholds satisfied
+  - quality checks passed
+- MANUAL_REVIEW if any mismatch/low confidence/quality issue
+- Provide structured reason codes for manual review
+
+### Trusted Template Rule (6th Auto-Approve)
+Implement template-based trust logic:
+- Build document template fingerprint/hash from extracted structure (headers + table layout + key anchors)
+- Track streak by: employee + vendor/company + template_hash
+- Increment streak only when manual review result is “Approved” with no data corrections
+- Reset streak on rejection, data correction, or template mismatch
+- If streak == 5 and current submission matches same employee/vendor/template and business values match, then 6th submission auto-approve
+- Mark approval type as: AUTO_APPROVE_TRUSTED_TEMPLATE
+
+## Data & Audit Requirements
+Persist:
+- Submission record
+- Step 1 input JSON
+- Raw extraction JSON (Textract/LLM outputs)
+- Normalized JSON
+- Comparison result JSON (field-by-field)
+- Decision + reason codes
+- Approval type: AUTO_APPROVE / MANUAL_REVIEW / AUTO_APPROVE_TRUSTED_TEMPLATE
+- Manual approved streak state/history
+- Timestamps/user metadata for audit trail
+
+## UI/UX Requirements
+- Add this as a flow in existing timesheet screen design (keep consistent with current UI)
+- Stepper UI: Step 1 (Form) → Step 2 (Upload & Validation Result)
+- Show extracted values vs entered values side-by-side with match/mismatch indicators
+- Show confidence badges
+- Show clear final status: Auto Approved / Sent to Manual Review
+- Show manual review reason list
+- Keep attachment upload as PDF/Image
+
+## API Design (suggested)
+Create endpoints:
+- POST /timesheet/submissions (create Step1 draft)
+- POST /timesheet/submissions/:id/attachment (upload doc)
+- POST /timesheet/submissions/:id/validate (extract + compare + decision)
+- GET /timesheet/submissions/:id (full details)
+- GET /timesheet/submissions/:id/history (audit trail)
+
+## Non-Functional
+- Clean modular architecture
+- Config-driven thresholds/rules
+- Robust error handling + retries for external services
+- Secure file handling, no hardcoded secrets
+- Environment-based AWS config
+- Logging for each pipeline stage
+
+## Deliverables
+1. End-to-end working POC integrated into existing system
+2. Source code with clear folder structure
+3. DB schema/migrations for submission, extraction, comparison, decisions, streak tracking
+4. Seed/demo data and at least 5 realistic test scenarios
+5. README with setup and run instructions
+6. Demo script: happy path, mismatch path, and trusted 6th auto-approve path
+
+## Acceptance Criteria
+- User can complete Step 1 with date-wise hours
+- User uploads PDF/image in Step 2
+- System extracts + compares against Step 1
+- Correct routing to AUTO_APPROVE or MANUAL_REVIEW with reasons
+- 5 manual approvals (same case, no corrections) lead to 6th AUTO_APPROVE_TRUSTED_TEMPLATE
+- Full audit history visible per submission
+
+Now implement this POC with clean, testable code and include a short explanation of architecture decisions.
