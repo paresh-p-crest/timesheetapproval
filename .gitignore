@@ -1,0 +1,30 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment secrets
+.env
+
+# Local runtime database/state
+*.db
+streamlit_poc.db
+
+# Sample/test inputs and generated extraction outputs
+samples/
+samples.zip
+batch_results/
+batch_extract_samples.py
+*.result.json
+*.result.pdf
+*.result.png
+
+# Local IDE/workspace metadata
+.vscode/
+.cursor/

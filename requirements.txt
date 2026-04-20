@@ -1,10 +1,4 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-pydantic
-python-multipart
 boto3
-langchain
 langchain-aws
 python-dotenv
 streamlit
