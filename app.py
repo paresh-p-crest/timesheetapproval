@@ -1545,6 +1545,10 @@ def compare_data(step1: Dict[str, Any], extracted: Dict[str, Any], tolerance: fl
     if has_extracted_daywise:
         for dt, expected in expected_map.items():
             actual = actual_map.get(dt)
+            # Some templates omit explicit zero-hour dates in extracted rows.
+            # If Step1 expects 0 and extracted date is missing, treat as 0 (match).
+            if actual is None and abs(expected) <= tolerance:
+                actual = 0.0
             if actual is None or abs(expected - actual) > tolerance:
                 hour_diffs.append({"date": dt, "expected": expected, "actual": actual})
                 result["hour_mismatch_count"] += 1
@@ -1865,11 +1869,6 @@ def recent_history(limit: int = 20) -> List[Dict[str, Any]]:
             reasons = json.loads(r[8]) if r[8] else []
         except json.JSONDecodeError:
             reasons = [str(r[8])]
-        reason_codes = []
-        try:
-            reason_codes = json.loads(r[9]) if r[9] else []
-        except json.JSONDecodeError:
-            reason_codes = [str(r[9])]
         out.append(
             {
                 "record_id": r[0],
@@ -1906,13 +1905,6 @@ def row_html(field: str, left: Any, right: Any, matched: bool) -> str:
     color = "#e8f7e8" if matched else "#fdeaea"
     status = "Match" if matched else "Mismatch"
     return f"<tr style='background:{color}'><td>{field}</td><td>{left}</td><td>{right}</td><td>{status}</td></tr>"
-
-
-def parse_iso_date(value: str, fallback: date) -> date:
-    try:
-        return datetime.strptime((value or "").strip(), "%Y-%m-%d").date()
-    except ValueError:
-        return fallback
 
 
 def parse_iso_date_optional(value: str) -> date | None:
@@ -2414,6 +2406,11 @@ def main() -> None:
                 decision = "MANUAL_REVIEW"
                 approval_type = "MANUAL_REVIEW"
                 reasons = reasons + [f"Quality issue: {x}" for x in quality_issues]
+            # Business rule: if everything matches, always auto approve.
+            if all_matched:
+                decision = "AUTO_APPROVE"
+                approval_type = "AUTO_APPROVE"
+                reasons = []
             reason_codes = build_reason_codes(decision, comparison, confidence, extraction.get("meta", {}))
             progress.progress(100, text="Completed")
             st.session_state.validation_result = {
