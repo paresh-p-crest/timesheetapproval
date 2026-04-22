@@ -28,6 +28,8 @@ APP_CONFIG = {
 }
 # Bump this when extraction/autofill mapping logic changes so cached autofill is recalculated.
 AUTOFILL_LOGIC_VERSION = "2026-04-17-v3"
+FIXED_AWS_REGION = "us-east-1"
+FIXED_BEDROCK_MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -39,6 +41,15 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def mask_secret(value: str, keep_last: int = 4) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= keep_last:
+        return "*" * len(raw)
+    return ("*" * (len(raw) - keep_last)) + raw[-keep_last:]
 
 
 def init_db() -> None:
@@ -181,10 +192,19 @@ def user_friendly_error(error_text: str) -> str:
         return "This PDF is password protected. Please upload an unlocked timesheet file."
     if "corrupted" in lowered or "unreadable" in lowered:
         return "The uploaded file looks unreadable or corrupted. Please upload a clear timesheet file."
+    if (
+        "expiredtoken" in lowered
+        or "accessdenied" in lowered
+        or "invalidsignatureexception" in lowered
+        or "unrecognizedclientexception" in lowered
+        or "unable to locate credentials" in lowered
+        or "security token included in the request is invalid" in lowered
+    ):
+        return "AWS credentials are missing/invalid/expired. Please open Navigation -> Settings and update AWS configuration."
     if "textract_failed" in lowered:
-        return "Could not read text from this file. Please upload a clear timesheet PDF/image."
+        return "Could not read text from this file. If AWS configuration is set, verify it in Navigation -> Settings, then retry."
     if "bedrock_normalization_failed" in lowered:
-        return "The file was read, but timesheet fields could not be interpreted. Please upload a clearer timesheet."
+        return "The file was read, but Bedrock normalization failed. Please check Bedrock Model ID/AWS credentials in Navigation -> Settings."
     return text or "Unable to process this file. Please upload a valid timesheet document."
 
 
@@ -287,6 +307,17 @@ def infer_approver_name_from_text(text: str) -> str:
             nm = clean_name(m.group(1))
             if nm:
                 return nm
+    return ""
+
+
+def infer_company_from_text(text: str) -> str:
+    raw = (text or "")
+    if not raw.strip():
+        return ""
+    lowered = normalize_text(raw)
+    # Common client label variants seen in timesheet templates.
+    if "capital one" in lowered or "capitalone" in lowered:
+        return "CapitalOne"
     return ""
 
 
@@ -1308,6 +1339,124 @@ def _apply_semi_monthly_weekend_zero_fix(normalized: Dict[str, Any], ocr_text: s
     normalized["total_hours"] = round(sum(x["hours"] for x in out), 2)
 
 
+def _apply_weekly_mon_fri_alignment_fix(normalized: Dict[str, Any]) -> None:
+    """
+    Fix weekly Sat..Fri templates where OCR/LLM can shift Monday-Friday hours into weekend columns.
+    Trigger only for clear 7-day weekly windows with a Sat/Sun/Mon... header signature.
+    """
+    headers = [normalize_text(str(x)) for x in (normalized.get("headers") or []) if x is not None]
+    table_cols = [str(x) for x in (normalized.get("table_columns") or []) if x is not None]
+    if not headers or "total" not in " ".join(headers):
+        return
+    # Signature like: Sat Sun Mon Tue Wed Thu Fri TOTAL
+    signature = ["sat", "sun", "mon", "tue", "wed", "thu", "fri"]
+    joined = " ".join(headers)
+    if not all(day in joined for day in signature):
+        return
+
+    ps = parse_iso_date_optional(str(normalized.get("period_start", "")))
+    pe = parse_iso_date_optional(str(normalized.get("period_end", "")))
+    if not ps or not pe or (pe - ps).days != 6:
+        return
+
+    rows = normalized.get("day_hours", []) if isinstance(normalized.get("day_hours"), list) else []
+    if len(rows) < 7:
+        return
+    by_date: Dict[str, float] = {}
+    for r in rows:
+        if isinstance(r, dict):
+            d = parse_iso_date_optional(str(r.get("date", "")))
+            if d:
+                by_date[d.isoformat()] = safe_float(r.get("hours", 0.0), 0.0)
+    week_dates = date_range(ps, pe)
+    week_vals = [by_date.get(d, 0.0) for d in week_dates]
+    non_zero_vals = [round(v, 2) for v in week_vals if v > 0]
+    if len(non_zero_vals) != 5:
+        return
+    dominant = Counter(non_zero_vals).most_common(1)[0][0] if non_zero_vals else 0.0
+    if dominant <= 0:
+        return
+    # Only normalize when total clearly implies Mon-Fri pattern.
+    total = safe_float(normalized.get("total_hours", None), None)
+    if total is None:
+        total = round(sum(week_vals), 2)
+    if abs(total - (5.0 * dominant)) > APP_CONFIG["hour_tolerance"]:
+        return
+
+    out: List[Dict[str, Any]] = []
+    for iso_dt in week_dates:
+        d = datetime.strptime(iso_dt, "%Y-%m-%d").date()
+        hrs = float(dominant) if d.weekday() < 5 else 0.0
+        out.append({"date": iso_dt, "hours": hrs})
+    normalized["day_hours"] = out
+    normalized["total_hours"] = round(sum(x["hours"] for x in out), 2)
+
+
+def _apply_beeline_total_hours_row_fix(normalized: Dict[str, Any], ocr_text: str) -> None:
+    """
+    Parse Beeline-style weekly grids where OCR includes:
+    - date headers: Sat 12/13 ... Fri 12/19
+    - totals row: TOTAL HOURS 0 0 8 8 8 8 8 40
+    Use date-cell aligned values (first 7 numbers) as day_hours.
+    """
+    raw = (ocr_text or "")
+    lowered = normalize_text(raw)
+    if "total hours" not in lowered or "pay code(required)" not in lowered:
+        return
+
+    # Capture Sat..Fri date headers.
+    m_dates = re.search(
+        r"Sat\s+(\d{1,2}/\d{1,2})\s+Sun\s+(\d{1,2}/\d{1,2})\s+Mon\s+(\d{1,2}/\d{1,2})\s+Tue\s+(\d{1,2}/\d{1,2})\s+Wed\s+(\d{1,2}/\d{1,2})\s+Thu\s+(\d{1,2}/\d{1,2})\s+Fri\s+(\d{1,2}/\d{1,2})",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not m_dates:
+        return
+    mmdd_list = [m_dates.group(i) for i in range(1, 8)]
+
+    # Determine year from "Dec 13 - Dec 19, 2025" style token or existing period.
+    inferred_year = None
+    m_year = re.search(r"[A-Za-z]{3,9}\s+\d{1,2}\s*-\s*[A-Za-z]{3,9}\s+\d{1,2},\s*(\d{4})", raw)
+    if m_year:
+        inferred_year = int(m_year.group(1))
+    if not inferred_year:
+        ps = parse_iso_date_optional(str(normalized.get("period_start", "")))
+        pe = parse_iso_date_optional(str(normalized.get("period_end", "")))
+        inferred_year = ps.year if ps else (pe.year if pe else None)
+    if not inferred_year:
+        return
+
+    # Parse TOTAL HOURS row: first 7 are per-day values, last one is weekly total.
+    m_vals = re.search(
+        r"TOTAL\s+HOURS\s+((?:\d+(?:\.\d+)?\s+){7})(\d+(?:\.\d+)?)",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not m_vals:
+        return
+    day_tokens = re.findall(r"\d+(?:\.\d+)?", m_vals.group(1))
+    if len(day_tokens) != 7:
+        return
+    day_values = [safe_float(x, 0.0) for x in day_tokens]
+
+    out: List[Dict[str, Any]] = []
+    parsed_dates: List[date] = []
+    for mmdd, hrs in zip(mmdd_list, day_values):
+        dt = _parse_date_any(f"{mmdd}/{inferred_year}", inferred_year)
+        if not dt:
+            return
+        parsed_dates.append(dt)
+        out.append({"date": dt.isoformat(), "hours": round(float(hrs), 2)})
+
+    if not out:
+        return
+    out.sort(key=lambda x: x["date"])
+    normalized["day_hours"] = out
+    normalized["period_start"] = min(parsed_dates).isoformat()
+    normalized["period_end"] = max(parsed_dates).isoformat()
+    normalized["total_hours"] = round(sum(x["hours"] for x in out), 2)
+
+
 def postprocess_normalized(normalized: Dict[str, Any], ocr_text: str) -> Dict[str, Any]:
     # Normalize day_hours date formats first (to stabilize comparisons).
     default_year = None
@@ -1391,6 +1540,14 @@ def postprocess_normalized(normalized: Dict[str, Any], ocr_text: str) -> Dict[st
     # Semi-monthly screen captures can produce shifted weekend values; normalize only when clearly inconsistent.
     try:
         _apply_semi_monthly_weekend_zero_fix(normalized, ocr_text)
+    except Exception:
+        pass
+    try:
+        _apply_weekly_mon_fri_alignment_fix(normalized)
+    except Exception:
+        pass
+    try:
+        _apply_beeline_total_hours_row_fix(normalized, ocr_text)
     except Exception:
         pass
 
@@ -1486,6 +1643,11 @@ def extract_and_normalize(file_bytes: bytes, filename: str, hints: Dict[str, Any
         inferred_approver_name = infer_approver_name_from_text(textract_out.get("text", ""))
         if inferred_approver_name:
             normalized["approver_name"] = inferred_approver_name
+    # Fallback company inference for templates where LLM leaves company blank.
+    if not normalize_text(str(normalized.get("company", ""))):
+        inferred_company = infer_company_from_text(textract_out.get("text", ""))
+        if inferred_company:
+            normalized["company"] = inferred_company
 
     if not normalized.get("confidence"):
         normalized["confidence"] = round(confidence_breakdown.get("aggregate_confidence", 0.0) / 100.0, 3)
@@ -1852,8 +2014,10 @@ def save_setting_text(key: str, value: str) -> None:
 
 
 def get_runtime_aws_config() -> Dict[str, str]:
-    aws_region = (get_setting_text("aws_region", "").strip() or os.getenv("AWS_REGION", "us-east-1")).strip()
-    bedrock_model_id = (get_setting_text("bedrock_model_id", "").strip() or os.getenv("BEDROCK_MODEL_ID", "")).strip()
+    aws_region = (get_setting_text("aws_region", "").strip() or os.getenv("AWS_REGION", FIXED_AWS_REGION)).strip()
+    bedrock_model_id = (
+        get_setting_text("bedrock_model_id", "").strip() or os.getenv("BEDROCK_MODEL_ID", FIXED_BEDROCK_MODEL_ID)
+    ).strip()
     aws_access_key_id = (get_setting_text("aws_access_key_id", "").strip() or os.getenv("AWS_ACCESS_KEY_ID", "")).strip()
     aws_secret_access_key = (
         get_setting_text("aws_secret_access_key", "").strip() or os.getenv("AWS_SECRET_ACCESS_KEY", "")
@@ -2074,8 +2238,8 @@ def apply_autofill_to_form(normalized: Dict[str, Any]) -> None:
         start_date = min(extracted_dates)
         end_date = max(extracted_dates)
     else:
-        start_date = st.session_state.get("period_start", date.today() - timedelta(days=6))
-        end_date = st.session_state.get("period_end", date.today())
+        start_date = st.session_state.get("period_start") or (date.today() - timedelta(days=6))
+        end_date = st.session_state.get("period_end") or date.today()
 
     if start_date > end_date:
         start_date, end_date = end_date, start_date
@@ -2149,6 +2313,29 @@ def enable_browser_autocomplete() -> None:
     )
 
 
+def force_sidebar_collapsed() -> None:
+    """Force sidebar to collapsed state on every rerun."""
+    components.html(
+        """
+<script>
+(function () {
+  const doc = window.parent.document;
+  if (!doc || !doc.body) return;
+  function collapse() {
+    const closeBtn = doc.querySelector('button[aria-label="Close sidebar"]');
+    if (closeBtn) closeBtn.click();
+  }
+  // Try immediately and shortly after render updates.
+  collapse();
+  setTimeout(collapse, 120);
+  setTimeout(collapse, 400);
+})();
+</script>
+        """,
+        height=0,
+    )
+
+
 def reset_pipeline_state(clear_source: bool = False) -> None:
     st.session_state.validation_result = None
     st.session_state.last_upload_fingerprint = None
@@ -2186,13 +2373,14 @@ def reset_step1_form_state() -> None:
 
 def main() -> None:
     init_db()
-    st.set_page_config(page_title="Timesheet Approval POC", layout="wide")
+    st.set_page_config(page_title="Timesheet Approval POC", layout="wide", initial_sidebar_state="collapsed")
+    force_sidebar_collapsed()
     st.title("Timesheet Approval POC")
     current_threshold = get_setting_int("trusted_streak_threshold", APP_CONFIG["trusted_streak_threshold"])
     current_threshold = max(1, min(6, current_threshold))
     APP_CONFIG["trusted_streak_threshold"] = current_threshold
 
-    page = st.sidebar.selectbox("Page", ["Approval", "Settings"])
+    page = st.sidebar.selectbox("Navigation", ["Approval", "Settings"])
     if page == "Settings":
         st.subheader("Settings")
         st.caption("Configure trusted template auto-approval threshold.")
@@ -2215,17 +2403,36 @@ def main() -> None:
 
         st.divider()
         st.subheader("AWS Runtime Configuration")
-        st.caption(
-            "Optional: Save AWS credentials/region/model here. If blank, app falls back to environment/.env values."
-        )
+        st.caption("Set AWS runtime values here. Default region/model are pre-filled for convenience.")
         runtime_cfg = get_runtime_aws_config()
-        aws_region_value = st.text_input("AWS Region", value=runtime_cfg.get("aws_region", "us-east-1"), key="set_aws_region")
+        aws_region_value = st.text_input(
+            "AWS Region",
+            value=runtime_cfg.get("aws_region", FIXED_AWS_REGION),
+            key="set_aws_region",
+            help=f"Default: {FIXED_AWS_REGION}",
+        )
         bedrock_model_value = st.text_input(
             "Bedrock Model ID",
-            value=runtime_cfg.get("bedrock_model_id", ""),
+            value=runtime_cfg.get("bedrock_model_id", FIXED_BEDROCK_MODEL_ID),
             key="set_bedrock_model_id",
+            help=f"Default: {FIXED_BEDROCK_MODEL_ID}",
         )
-        st.caption("Enter credentials only when needed. Leave secret fields blank to keep current saved values.")
+        saved_access = get_setting_text("aws_access_key_id", "").strip()
+        saved_secret = get_setting_text("aws_secret_access_key", "").strip()
+        saved_token = get_setting_text("aws_session_token", "").strip()
+        st.caption("Enter credentials only when needed. Leave inputs blank to keep current saved values.")
+        if saved_access:
+            st.success(f"AWS Access Key ID: Saved ({mask_secret(saved_access, keep_last=4)})")
+        else:
+            st.warning("AWS Access Key ID: Not saved")
+        if saved_secret:
+            st.success(f"AWS Secret Access Key: Saved ({mask_secret(saved_secret, keep_last=4)})")
+        else:
+            st.warning("AWS Secret Access Key: Not saved")
+        if saved_token:
+            st.success(f"AWS Session Token: Saved ({mask_secret(saved_token, keep_last=6)})")
+        else:
+            st.info("AWS Session Token: Not saved (optional)")
         aws_access_key_input = st.text_input(
             "AWS Access Key ID",
             value="",
@@ -2249,8 +2456,8 @@ def main() -> None:
         )
 
         if st.button("Save AWS Configuration"):
-            save_setting_text("aws_region", (aws_region_value or "").strip())
-            save_setting_text("bedrock_model_id", (bedrock_model_value or "").strip())
+            save_setting_text("aws_region", (aws_region_value or FIXED_AWS_REGION).strip())
+            save_setting_text("bedrock_model_id", (bedrock_model_value or FIXED_BEDROCK_MODEL_ID).strip())
             if (aws_access_key_input or "").strip():
                 save_setting_text("aws_access_key_id", aws_access_key_input.strip())
             if (aws_secret_key_input or "").strip():
@@ -2258,12 +2465,14 @@ def main() -> None:
             if (aws_session_token_input or "").strip():
                 save_setting_text("aws_session_token", aws_session_token_input.strip())
             st.success("AWS configuration saved.")
+            st.rerun()
 
         if st.button("Clear Saved AWS Credentials"):
             save_setting_text("aws_access_key_id", "")
             save_setting_text("aws_secret_access_key", "")
             save_setting_text("aws_session_token", "")
             st.success("Saved AWS credentials cleared. Environment/.env fallback will be used.")
+            st.rerun()
         return
 
     if "validation_result" not in st.session_state:
@@ -2349,27 +2558,49 @@ def main() -> None:
             autofill_bytes = autofill_file.getvalue()
             autofill_fingerprint = hashlib.sha256(autofill_bytes).hexdigest()
             autofill_signature = f"{autofill_fingerprint}:{AUTOFILL_LOGIC_VERSION}"
+            previous_source_fingerprint = st.session_state.source_file_fingerprint
+
+            # New uploaded source should start fresh: hide previous processed result
+            # and clear old Step1 values before refilling from new file.
+            if previous_source_fingerprint and previous_source_fingerprint != autofill_fingerprint:
+                reset_pipeline_state(clear_source=False)
+                st.session_state.autofill_extraction_preview = None
+                st.session_state["employee_name"] = ""
+                st.session_state["vendor"] = ""
+                st.session_state["company"] = ""
+                st.session_state["duration"] = "Weekly"
+                st.session_state["period_start"] = None
+                st.session_state["period_end"] = None
+                st.session_state["autofill_hours_map"] = {}
+                for key in list(st.session_state.keys()):
+                    if key.startswith("hr_"):
+                        st.session_state.pop(key, None)
+
             st.session_state.source_file_bytes = autofill_bytes
             st.session_state.source_file_name = autofill_file.name
             st.session_state.source_file_fingerprint = autofill_fingerprint
             if st.session_state.autofill_last_signature != autofill_signature:
-                progress = st.progress(10, text="Auto-fill: extracting data...")
-                autofill_extraction = extract_and_normalize(
-                    autofill_bytes,
-                    autofill_file.name,
-                    hints={"duration": "", "period_start": "", "period_end": ""},
-                )
-                normalized = autofill_extraction["normalized"]
-                apply_autofill_to_form(normalized)
-                st.session_state.autofill_extraction_preview = autofill_extraction
-                st.session_state.autofill_last_fingerprint = autofill_fingerprint
-                st.session_state.autofill_last_signature = autofill_signature
-                progress.progress(100, text="Auto-fill completed")
-                if normalized.get("error"):
-                    st.error(user_friendly_error(normalized["error"]))
-                else:
-                    st.success("Fields auto-filled. Review/edit below.")
-                    st.rerun()
+                try:
+                    progress = st.progress(10, text="Auto-fill: extracting data...")
+                    autofill_extraction = extract_and_normalize(
+                        autofill_bytes,
+                        autofill_file.name,
+                        hints={"duration": "", "period_start": "", "period_end": ""},
+                    )
+                    normalized = autofill_extraction["normalized"]
+                    apply_autofill_to_form(normalized)
+                    st.session_state.autofill_extraction_preview = autofill_extraction
+                    st.session_state.autofill_last_fingerprint = autofill_fingerprint
+                    st.session_state.autofill_last_signature = autofill_signature
+                    progress.progress(100, text="Auto-fill completed")
+                    if normalized.get("error"):
+                        st.error(user_friendly_error(normalized["error"]))
+                    else:
+                        st.success("Fields auto-filled. Review/edit below.")
+                        st.rerun()
+                except Exception as exc:
+                    st.session_state.autofill_extraction_preview = None
+                    st.error(user_friendly_error(str(exc)))
         else:
             # File removed from Step 1: clear previous source + processed pipeline UI.
             if st.session_state.source_file_bytes is not None:
