@@ -2153,8 +2153,16 @@ def compare_data(step1: Dict[str, Any], extracted: Dict[str, Any], tolerance: fl
                 "actual": extracted.get(required_field, ""),
             }
             result["critical_ok"] = False
+    step1_ps = parse_iso_date_optional(str(step1.get("period_start", "")))
+    step1_pe = parse_iso_date_optional(str(step1.get("period_end", "")))
     for field in ["period_start", "period_end"]:
         ok = (step1.get(field) or "") == (extracted.get(field) or "")
+        # Accept extracted period boundary dates that fall inside Step 1 selected range.
+        # This avoids false mismatches on summary-style sheets that report an in-range anchor date.
+        if not ok and step1_ps and step1_pe:
+            extracted_dt = parse_iso_date_optional(str(extracted.get(field, "")))
+            if extracted_dt and step1_ps <= extracted_dt <= step1_pe:
+                ok = True
         result["matches"][field] = ok
         if not ok:
             result["mismatches"][field] = {"expected": step1.get(field), "actual": extracted.get(field)}
@@ -2323,8 +2331,6 @@ def compare_data(step1: Dict[str, Any], extracted: Dict[str, Any], tolerance: fl
     # Coverage-friendly period rule:
     # If extracted dates are fully inside Step1 period and missing Step1 dates are zero-expected,
     # treat period_start/period_end as matched (avoids false manual review for leave/holiday gaps).
-    step1_ps = parse_iso_date_optional(str(step1.get("period_start", "")))
-    step1_pe = parse_iso_date_optional(str(step1.get("period_end", "")))
     actual_date_objs = [parse_iso_date_optional(str(dt)) for dt in actual_map.keys() if dt]
     actual_date_objs = [d for d in actual_date_objs if d is not None]
     if step1_ps and step1_pe and actual_date_objs:
@@ -3929,8 +3935,22 @@ def main() -> None:
                 right = format_person_name_display(extracted.get(field, "")) or extracted.get(field, "-")
             else:
                 right = extracted.get(field, "-")
-            if field in ["period_start", "period_end"] and comparison.get("period_coverage_note"):
-                right = f"{right} (within selected range)"
+            if field in ["period_start", "period_end"]:
+                step_dt = parse_iso_date_optional(str(step1.get(field, "")))
+                extracted_dt = parse_iso_date_optional(str(extracted.get(field, "")))
+                step1_ps = parse_iso_date_optional(str(step1.get("period_start", "")))
+                step1_pe = parse_iso_date_optional(str(step1.get("period_end", "")))
+                is_in_range_non_exact_match = (
+                    matched
+                    and step_dt is not None
+                    and extracted_dt is not None
+                    and step_dt != extracted_dt
+                    and step1_ps is not None
+                    and step1_pe is not None
+                    and step1_ps <= extracted_dt <= step1_pe
+                )
+                if comparison.get("period_coverage_note") or is_in_range_non_exact_match:
+                    right = f"{right} (within selected range)"
             html += row_html(field, left, right, matched)
         html += "</table>"
         st.markdown(html, unsafe_allow_html=True)
