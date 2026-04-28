@@ -2319,6 +2319,26 @@ def compare_data(step1: Dict[str, Any], extracted: Dict[str, Any], tolerance: fl
     result["matches"]["total_hours"] = ok
     if not ok:
         result["mismatches"]["total_hours"] = {"expected": expected_total, "actual": actual_total_num}
+
+    # Coverage-friendly period rule:
+    # If extracted dates are fully inside Step1 period and missing Step1 dates are zero-expected,
+    # treat period_start/period_end as matched (avoids false manual review for leave/holiday gaps).
+    step1_ps = parse_iso_date_optional(str(step1.get("period_start", "")))
+    step1_pe = parse_iso_date_optional(str(step1.get("period_end", "")))
+    actual_date_objs = [parse_iso_date_optional(str(dt)) for dt in actual_map.keys() if dt]
+    actual_date_objs = [d for d in actual_date_objs if d is not None]
+    if step1_ps and step1_pe and actual_date_objs:
+        extracted_within_step1 = all(step1_ps <= d <= step1_pe for d in actual_date_objs)
+        missing_non_zero_expected = any(
+            (dt not in actual_map) and (abs(safe_float(expected, 0.0)) > tolerance)
+            for dt, expected in expected_map.items()
+        )
+        if extracted_within_step1 and not missing_non_zero_expected and result["matches"].get("total_hours", False):
+            result["matches"]["period_start"] = True
+            result["matches"]["period_end"] = True
+            result["mismatches"].pop("period_start", None)
+            result["mismatches"].pop("period_end", None)
+            result["period_coverage_note"] = "Partial extracted dates within selected Step 1 range"
     return result
 
 
@@ -3365,8 +3385,15 @@ def main() -> None:
             headers_accum: List[str] = []
             file_fp_counts = Counter(x.get("fingerprint", "") for x in selected_files)
             consumed_fp: Dict[str, int] = {}
+            merged_date_owner: Dict[str, str] = {}
+            file_added_dates: Dict[str, set[str]] = {}
+            file_included_hours_map: Dict[str, float] = {}
+            file_notes_map: Dict[str, List[str]] = {}
+            row_idx_by_key: Dict[str, int] = {}
+            force_exclude_keys: set[str] = set()
 
             for idx, file_obj in enumerate(selected_files, start=1):
+                file_key = f"{idx}::{file_obj.get('name', '')}"
                 extraction_i = extract_and_normalize(file_obj["bytes"], file_obj["name"], hints=hints)
                 normalized_i = extraction_i.get("normalized", {}) if isinstance(extraction_i, dict) else {}
                 file_ext = os.path.splitext(str(file_obj.get("name", "")).lower())[1]
@@ -3380,7 +3407,9 @@ def main() -> None:
                 merged_ocr_parts.append((extraction_i.get("ocr_text") or "").strip())
                 conf_vals.append(safe_float(normalized_i.get("confidence", 0.0), 0.0))
 
-                file_notes: List[str] = []
+                file_notes: List[str] = file_notes_map.setdefault(file_key, [])
+                file_added_dates.setdefault(file_key, set())
+                file_included_hours_map.setdefault(file_key, 0.0)
                 critical_missing = []
                 for crit_key in ["employee_name", "vendor", "company"]:
                     crit_val = normalize_text(str(normalized_i.get(crit_key, "") or ""))
@@ -3443,6 +3472,7 @@ def main() -> None:
                 contributes_to_range = False
                 included_hours_for_file = 0.0
                 merged_dates_added_from_file: List[str] = []
+                duplicate_data_upload = False
                 for row in extracted_rows:
                     if not isinstance(row, dict):
                         continue
@@ -3462,6 +3492,7 @@ def main() -> None:
                     if (not duplicate_upload) and (not mismatched_with_step1) and (not critical_missing) and approval_found:
                         if dt_text in merged_hours:
                             if abs(merged_hours[dt_text] - hour_val) > APP_CONFIG["hour_tolerance"]:
+                                owner_key = merged_date_owner.get(dt_text, "")
                                 overlap_conflicts.append(
                                     {
                                         "date": dt_text,
@@ -3470,11 +3501,38 @@ def main() -> None:
                                         "file": file_obj["name"],
                                     }
                                 )
-                                file_notes.append(f"Overlap conflict on {dt_text}")
+                                conflict_note = f"Overlap conflict on {dt_text}"
+                                file_notes.append(conflict_note)
+                                if owner_key:
+                                    owner_notes = file_notes_map.setdefault(owner_key, [])
+                                    if conflict_note not in owner_notes:
+                                        owner_notes.append(conflict_note)
+                                    force_exclude_keys.add(owner_key)
+                                    for odt in file_added_dates.get(owner_key, set()):
+                                        merged_hours.pop(odt, None)
+                                    file_included_hours_map[owner_key] = 0.0
+                                    if owner_key in row_idx_by_key:
+                                        owner_row = per_file_status[row_idx_by_key[owner_key]]
+                                        owner_row["Included in Merged Total"] = "No"
+                                        owner_row["Included Hours"] = 0.0
+                                        owner_row["Status"] = "Needs Review"
+                                        owner_row["Details"] = "; ".join(file_notes_map.get(owner_key, [])) or "Needs Review"
+                                force_exclude_keys.add(file_key)
+                            else:
+                                # Same date with same hours already provided by another file:
+                                # treat current file as duplicate/redundant and exclude it.
+                                duplicate_data_upload = True
+                                duplicate_note = f"Duplicate data for {dt_text}"
+                                if duplicate_note not in file_notes:
+                                    file_notes.append(duplicate_note)
+                                force_exclude_keys.add(file_key)
                         else:
                             merged_hours[dt_text] = hour_val
                             included_hours_for_file += hour_val
+                            file_included_hours_map[file_key] = file_included_hours_map.get(file_key, 0.0) + hour_val
                             merged_dates_added_from_file.append(dt_text)
+                            file_added_dates[file_key].add(dt_text)
+                            merged_date_owner[dt_text] = file_key
                     else:
                         excluded_day_entries.append(
                             {
@@ -3524,7 +3582,10 @@ def main() -> None:
                 if not contributes_to_range:
                     file_notes.append("Outside selected Step 1 date range")
                 excluded_from_merge = (
+                    file_key in force_exclude_keys
+                    or
                     duplicate_upload
+                    or duplicate_data_upload
                     or bool(critical_missing)
                     or bool(mismatched_with_step1)
                     or (not contributes_to_range)
@@ -3539,6 +3600,7 @@ def main() -> None:
                     for dt_added in merged_dates_added_from_file:
                         merged_hours.pop(dt_added, None)
                     included_hours_for_file = 0.0
+                    file_included_hours_map[file_key] = 0.0
                 per_file_included_hours_total += included_hours_for_file
                 if isinstance(normalized_i.get("headers"), list):
                     headers_accum.extend(str(x) for x in normalized_i.get("headers") if x is not None)
@@ -3547,14 +3609,16 @@ def main() -> None:
 
                 per_file_status.append(
                     {
+                        "__file_key": file_key,
                         "File Name": file_obj["name"],
                         "Extracted Period": f"{extracted_ps or '-'} to {extracted_pe or '-'}",
                         "Included in Merged Total": "No" if excluded_from_merge else "Yes",
-                        "Included Hours": round(included_hours_for_file, 2),
+                        "Included Hours": round(file_included_hours_map.get(file_key, included_hours_for_file), 2),
                         "Status": "Needs Review" if file_notes else "OK",
                         "Details": "; ".join(file_notes) if file_notes else "No issues",
                     }
                 )
+                row_idx_by_key[file_key] = len(per_file_status) - 1
 
             merged["headers"] = headers_accum
             merged["table_columns"] = table_columns_accum
@@ -3635,6 +3699,77 @@ def main() -> None:
                 extraction = extract_and_normalize(file_obj["bytes"], file_obj["name"], hints=hints)
             precheck_issues = extraction.get("meta", {}).get("prevalidation", {}).get("issues", [])
             quality_issues = extraction.get("meta", {}).get("quality_validation", {}).get("issues", [])
+            if st.session_state.entry_mode == "Manual Entry":
+                normalized_single = extraction.get("normalized", {}) if isinstance(extraction, dict) else {}
+                step1_start = parse_iso_date_optional(step1_ps_text)
+                step1_end = parse_iso_date_optional(step1_pe_text)
+                file_notes: List[str] = []
+                critical_missing = []
+                for crit_key in ["employee_name", "vendor", "company"]:
+                    if not normalize_text(str(normalized_single.get(crit_key, "") or "")):
+                        critical_missing.append(crit_key)
+                if critical_missing:
+                    file_notes.append(f"Missing fields: {', '.join(critical_missing)}")
+                mismatched_with_step1: List[str] = []
+                if canonical_person_name(str(normalized_single.get("employee_name", "") or "")) != canonical_person_name(employee_name):
+                    mismatched_with_step1.append(
+                        f"employee_name (Step1='{format_person_name_display(employee_name)}', File='{format_person_name_display(str(normalized_single.get('employee_name', '') or ''))}')"
+                    )
+                if normalize_text(str(normalized_single.get("vendor", "") or "")) != normalize_text(vendor):
+                    mismatched_with_step1.append(
+                        f"vendor (Step1='{vendor}', File='{str(normalized_single.get('vendor', '') or '')}')"
+                    )
+                if normalize_text(str(normalized_single.get("company", "") or "")) != normalize_text(company):
+                    mismatched_with_step1.append(
+                        f"company (Step1='{company}', File='{str(normalized_single.get('company', '') or '')}')"
+                    )
+                if mismatched_with_step1:
+                    file_notes.extend(mismatched_with_step1)
+
+                approved_text = normalize_text(str(normalized_single.get("approved", "") or ""))
+                approver_name_text = str(normalized_single.get("approver_name", "") or "").strip()
+                has_named_approver = bool(approver_name_text) and is_probable_person_name(approver_name_text)
+                generic_approval_tokens = {"", "approved", "approved by", "signature", "signed", "yes", "yes/signature", "no", "none", "na", "n/a", "rejected", "declined", "pending"}
+                approval_found = has_named_approver or (approved_text not in generic_approval_tokens)
+
+                extracted_rows = normalized_single.get("day_hours", []) if isinstance(normalized_single.get("day_hours"), list) else []
+                contributes_to_range = False
+                included_hours_for_file = 0.0
+                for row in extracted_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    dt_obj = parse_iso_date_optional(str(row.get("date", "") or ""))
+                    if not dt_obj:
+                        continue
+                    if step1_start and step1_end and (dt_obj < step1_start or dt_obj > step1_end):
+                        continue
+                    contributes_to_range = True
+                    included_hours_for_file += safe_float(row.get("hours", 0.0), 0.0)
+                if not contributes_to_range:
+                    file_notes.append("Outside selected Step 1 date range")
+                if contributes_to_range and not approval_found:
+                    file_notes.append("Approval signal missing for contributing file")
+                excluded_from_merge = (
+                    bool(critical_missing)
+                    or bool(mismatched_with_step1)
+                    or (not contributes_to_range)
+                    or (contributes_to_range and not approval_found)
+                )
+                if excluded_from_merge:
+                    included_hours_for_file = 0.0
+                extracted_ps = str(normalized_single.get("period_start", "") or "")
+                extracted_pe = str(normalized_single.get("period_end", "") or "")
+                per_file_status = [
+                    {
+                        "File Name": file_obj["name"],
+                        "Extracted Period": f"{extracted_ps or '-'} to {extracted_pe or '-'}",
+                        "Included in Merged Total": "No" if excluded_from_merge else "Yes",
+                        "Included Hours": round(included_hours_for_file, 2),
+                        "Status": "Needs Review" if file_notes else "OK",
+                        "Details": "; ".join(file_notes) if file_notes else "No issues",
+                    }
+                ]
+                per_file_included_hours_total = round(included_hours_for_file, 2)
 
         progress.progress(70, text="Comparing with Step 1...")
         extracted = extraction["normalized"]
@@ -3747,6 +3882,8 @@ def main() -> None:
             )
             if per_file_status:
                 per_file_df = pd.DataFrame(per_file_status)
+                if "__file_key" in per_file_df.columns:
+                    per_file_df = per_file_df.drop(columns=["__file_key"])
                 def _highlight_row(row: pd.Series) -> List[str]:
                     bg = "#e8f5e9" if str(row.get("Included in Merged Total", "")) == "Yes" else "#ffebee"
                     return [f"background-color: {bg}"] * len(row)
@@ -3792,9 +3929,13 @@ def main() -> None:
                 right = format_person_name_display(extracted.get(field, "")) or extracted.get(field, "-")
             else:
                 right = extracted.get(field, "-")
+            if field in ["period_start", "period_end"] and comparison.get("period_coverage_note"):
+                right = f"{right} (within selected range)"
             html += row_html(field, left, right, matched)
         html += "</table>"
         st.markdown(html, unsafe_allow_html=True)
+        if comparison.get("period_coverage_note"):
+            st.caption(str(comparison.get("period_coverage_note")))
 
         if comparison.get("day_hours_missing_in_extracted"):
             st.info("Day-wise hours not found in uploaded sheet. Comparison is based on period and total hours.")

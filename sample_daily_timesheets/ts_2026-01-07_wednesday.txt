@@ -5,5 +5,5 @@ Company: CapitalOne
 Time Duration: Daily
 Work Date: 2026-01-07
 Day: Wednesday
-Hours: 6.50
+Hours: 7
 Approved By: Sarah Mitchell

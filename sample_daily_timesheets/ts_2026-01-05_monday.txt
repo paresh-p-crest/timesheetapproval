@@ -6,7 +6,4 @@ Time Duration: Daily
 Work Date: 2026-01-05
 Day: Monday
 Hours: 7.50
-Work Date: 2026-01-06
-Day: Tuesday
-Hours: 8
 Approved By: Sarah Mitchell
