@@ -3,12 +3,15 @@ import io
 import json
 import os
 import re
+import zipfile
 from collections import Counter, defaultdict
 import sqlite3
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Tuple
+import xml.etree.ElementTree as ET
 
 import boto3
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
@@ -19,7 +22,7 @@ from pypdf import PdfReader
 load_dotenv(".env")
 
 DB_PATH = "streamlit_poc.db"
-SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
+SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".txt", ".doc", ".docx"}
 APP_CONFIG = {
     "hour_tolerance": 0.01,
     "confidence_threshold": 0.8,
@@ -249,7 +252,7 @@ def user_friendly_error(error_text: str) -> str:
     text = (error_text or "").strip()
     lowered = text.lower()
     if "unsupporteddocumentexception" in lowered or "unsupported format" in lowered:
-        return "Uploaded file is not a supported timesheet document. Please upload a valid PDF/JPG/PNG timesheet."
+        return "Uploaded file is not a supported timesheet document. Please upload a valid PDF/JPG/PNG/TXT/DOC/DOCX timesheet."
     if "password-protected pdf" in lowered:
         return "This PDF is password protected. Please upload an unlocked timesheet file."
     if "corrupted" in lowered or "unreadable" in lowered:
@@ -436,6 +439,52 @@ def extract_text_from_pdf_local(file_bytes: bytes) -> str:
     return "\n".join(out).strip()
 
 
+def extract_text_from_txt_local(file_bytes: bytes) -> str:
+    for enc in ["utf-8", "utf-16", "latin-1"]:
+        try:
+            return file_bytes.decode(enc, errors="ignore").strip()
+        except Exception:
+            continue
+    return ""
+
+
+def extract_text_from_docx_local(file_bytes: bytes) -> str:
+    """
+    Lightweight DOCX text extraction without adding dependencies.
+    Reads word/document.xml and joins text runs.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            if "word/document.xml" not in zf.namelist():
+                return ""
+            xml_bytes = zf.read("word/document.xml")
+        root = ET.fromstring(xml_bytes)
+        text_parts: List[str] = []
+        for node in root.iter():
+            # DOCX namespaces vary; keep suffix-only matching for robustness.
+            if str(node.tag).endswith("}t") and node.text:
+                text_parts.append(node.text)
+            elif str(node.tag).endswith("}p"):
+                text_parts.append("\n")
+        return re.sub(r"\n{3,}", "\n\n", "".join(text_parts)).strip()
+    except Exception:
+        return ""
+
+
+def extract_text_from_doc_local(file_bytes: bytes) -> str:
+    """
+    Best-effort extraction for legacy .doc binary files.
+    Pulls printable text segments; suitable for local testing files.
+    """
+    try:
+        raw = file_bytes.decode("latin-1", errors="ignore")
+    except Exception:
+        return ""
+    chunks = re.findall(r"[A-Za-z0-9][A-Za-z0-9\s:/,._\-]{3,}", raw)
+    cleaned = [c.strip() for c in chunks if len(c.strip()) >= 4]
+    return "\n".join(cleaned[:400]).strip()
+
+
 def prevalidate_file(file_bytes: bytes, filename: str) -> Dict[str, Any]:
     ext = os.path.splitext((filename or "").lower())[1]
     issues: List[str] = []
@@ -444,7 +493,11 @@ def prevalidate_file(file_bytes: bytes, filename: str) -> Dict[str, Any]:
         issues.append(f"Unsupported format: {ext or 'unknown'}")
         return {"failed": True, "issues": issues, "details": details}
 
-    if ext == ".pdf":
+    if ext in {".txt", ".doc", ".docx"}:
+        details["document_type"] = ext
+        if not file_bytes:
+            issues.append("Empty document")
+    elif ext == ".pdf":
         try:
             reader = PdfReader(io.BytesIO(file_bytes))
             details["pdf_page_count"] = len(reader.pages)
@@ -695,6 +748,25 @@ def _parse_date_any(value: str, default_year: int | None = None) -> date | None:
             return None
 
     return None
+
+
+def extract_explicit_dates_from_text(text: str) -> set[str]:
+    raw = str(text or "")
+    if not raw.strip():
+        return set()
+    out: set[str] = set()
+    patterns = [
+        r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b",
+        r"\b\d{1,2}/\d{1,2}/\d{4}\b",
+        r"\b[A-Za-z]{3,9}\s+\d{1,2}(?:\s+\d{4})?\b",
+        r"\b\d{1,2}\s+[A-Za-z]{3,9}(?:\s+\d{4})?\b",
+    ]
+    for pat in patterns:
+        for token in re.findall(pat, raw):
+            dt = _parse_date_any(str(token))
+            if dt:
+                out.add(dt.isoformat())
+    return out
 
 
 def _extract_candidate_periods_from_text(text: str, default_year: int | None) -> List[Tuple[date, date]]:
@@ -1921,8 +1993,20 @@ def extract_and_normalize(file_bytes: bytes, filename: str, hints: Dict[str, Any
     meta["quality_validation"] = quality
     ext = os.path.splitext((filename or "").lower())[1]
     try:
-        textract_out = textract_extract(file_bytes, filename)
-        meta["textract_used"] = True
+        if ext in {".pdf", ".png", ".jpg", ".jpeg"}:
+            textract_out = textract_extract(file_bytes, filename)
+            meta["textract_used"] = True
+        elif ext == ".txt":
+            textract_out = {"raw": {"fallback": "txt_text_extract"}, "text": extract_text_from_txt_local(file_bytes), "filename": filename}
+            meta["textract_used"] = False
+        elif ext == ".docx":
+            textract_out = {"raw": {"fallback": "docx_text_extract"}, "text": extract_text_from_docx_local(file_bytes), "filename": filename}
+            meta["textract_used"] = False
+        elif ext == ".doc":
+            textract_out = {"raw": {"fallback": "doc_text_extract"}, "text": extract_text_from_doc_local(file_bytes), "filename": filename}
+            meta["textract_used"] = False
+        else:
+            return {"normalized": default_normalized(f"unsupported_extension: {ext}"), "raw": {"error": f"Unsupported extension: {ext}"}, "meta": meta}
     except Exception as exc:
         err = str(exc)
         # Some PDFs are rejected by AnalyzeDocument depending on internal format.
@@ -1943,6 +2027,13 @@ def extract_and_normalize(file_bytes: bytes, filename: str, hints: Dict[str, Any
                 }
         else:
             return {"normalized": default_normalized(f"textract_failed: {exc}"), "raw": {"error": str(exc)}, "meta": meta}
+
+    if not (textract_out.get("text", "") or "").strip():
+        return {
+            "normalized": default_normalized("No readable text found in document"),
+            "raw": {"error": "No readable text found in document"},
+            "meta": meta,
+        }
 
     bedrock_failed = False
     try:
@@ -2080,6 +2171,18 @@ def compare_data(step1: Dict[str, Any], extracted: Dict[str, Any], tolerance: fl
     expected_map = {d["date"]: float(d["hours"]) for d in step1.get("day_hours", [])}
     extracted_rows = extracted.get("day_hours", []) if isinstance(extracted.get("day_hours"), list) else []
     actual_map = {d.get("date"): safe_float(d.get("hours", 0), 0.0) for d in extracted_rows if d.get("date")}
+    observed_rows = (
+        extracted.get("observed_day_hours_all_files", [])
+        if isinstance(extracted.get("observed_day_hours_all_files"), list)
+        else []
+    )
+    observed_map = {d.get("date"): safe_float(d.get("hours", 0), 0.0) for d in observed_rows if d.get("date")}
+    excluded_rows = (
+        extracted.get("excluded_day_hours", [])
+        if isinstance(extracted.get("excluded_day_hours"), list)
+        else []
+    )
+    excluded_map = {d.get("date"): d for d in excluded_rows if isinstance(d, dict) and d.get("date")}
     hdr_tokens: List[str] = []
     if isinstance(extracted.get("headers"), list):
         hdr_tokens.extend(str(x) for x in extracted.get("headers") if x is not None)
@@ -2109,12 +2212,25 @@ def compare_data(step1: Dict[str, Any], extracted: Dict[str, Any], tolerance: fl
             # If Step1 expects 0 and extracted date is missing, treat as 0 (match).
             if actual is None and abs(expected) <= tolerance:
                 actual = 0.0
+            excluded_note = ""
+            if actual is None and dt in excluded_map:
+                # Date exists in uploads, but was intentionally excluded from merged
+                # totals due per-file Step1 mismatch checks.
+                actual = 0.0
+                excluded_note = str(excluded_map.get(dt, {}).get("reason", "Excluded from merged total"))
+            elif actual is None and dt in observed_map:
+                actual = observed_map.get(dt)
             if actual is None or abs(expected - actual) > tolerance:
-                hour_diffs.append({"date": dt, "expected": expected, "actual": actual})
+                row = {"date": dt, "expected": expected, "actual": actual}
+                if excluded_note:
+                    row["note"] = excluded_note
+                hour_diffs.append(row)
                 result["hour_mismatch_count"] += 1
         result["matches"]["day_hours"] = len(hour_diffs) == 0
         if hour_diffs:
             result["mismatches"]["day_hours"] = hour_diffs
+    if excluded_rows:
+        result["excluded_day_hours"] = excluded_rows
     else:
         # Some summary templates have only week totals and no day-wise rows.
         # Do not force a day-wise mismatch in this case; compare via period + total hours.
@@ -2406,6 +2522,36 @@ def save_setting_text(key: str, value: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def load_manual_step1_prefill() -> Dict[str, Any]:
+    raw = get_setting_text("manual_step1_prefill", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def save_manual_step1_prefill(step1: Dict[str, Any]) -> None:
+    payload = {
+        "employee_name": str(step1.get("employee_name", "") or ""),
+        "vendor": str(step1.get("vendor", "") or ""),
+        "company": str(step1.get("company", "") or ""),
+        "duration": str(step1.get("duration", "") or ""),
+        "period_start": str(step1.get("period_start", "") or ""),
+        "period_end": str(step1.get("period_end", "") or ""),
+        "day_hours": step1.get("day_hours", []) if isinstance(step1.get("day_hours"), list) else [],
+    }
+    save_setting_text("manual_step1_prefill", json.dumps(payload))
+
+
+def clear_manual_step1_prefill() -> None:
+    save_setting_text("manual_step1_prefill", "")
 
 
 def get_runtime_aws_config() -> Dict[str, str]:
@@ -2746,6 +2892,7 @@ def force_sidebar_collapsed() -> None:
 def reset_pipeline_state(clear_source: bool = False) -> None:
     st.session_state.validation_result = None
     st.session_state.last_upload_fingerprint = None
+    st.session_state.last_submission_hash = None
     if clear_source:
         st.session_state.source_file_bytes = None
         st.session_state.source_file_name = ""
@@ -2886,6 +3033,8 @@ def main() -> None:
         st.session_state.validation_result = None
     if "last_upload_fingerprint" not in st.session_state:
         st.session_state.last_upload_fingerprint = None
+    if "last_submission_hash" not in st.session_state:
+        st.session_state.last_submission_hash = None
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = 1
     if "autofill_uploader_key" not in st.session_state:
@@ -2908,6 +3057,8 @@ def main() -> None:
         st.session_state.entry_mode = "Auto-Fill from Uploaded Timesheet"
     if "enable_duplicate_check" not in st.session_state:
         st.session_state.enable_duplicate_check = False
+    if "manual_prefill_loaded" not in st.session_state:
+        st.session_state.manual_prefill_loaded = False
     if "pending_step1_reset" not in st.session_state:
         st.session_state.pending_step1_reset = False
     if "employee_name" not in st.session_state:
@@ -2954,11 +3105,51 @@ def main() -> None:
         horizontal=True,
     )
 
+    if st.session_state.entry_mode == "Manual Entry" and not st.session_state.manual_prefill_loaded:
+        cached = load_manual_step1_prefill()
+        if cached:
+            st.session_state["employee_name"] = str(cached.get("employee_name", "") or "")
+            st.session_state["vendor"] = str(cached.get("vendor", "") or "")
+            st.session_state["company"] = str(cached.get("company", "") or "")
+            cached_duration = str(cached.get("duration", "") or "")
+            if cached_duration in ["Weekly", "Bi-Weekly", "Semi-Monthly", "Monthly"]:
+                st.session_state["duration"] = cached_duration
+            cached_ps = parse_iso_date_optional(str(cached.get("period_start", "") or ""))
+            cached_pe = parse_iso_date_optional(str(cached.get("period_end", "") or ""))
+            st.session_state["period_start"] = cached_ps
+            st.session_state["period_end"] = cached_pe
+            if cached_ps and cached_pe and cached_pe >= cached_ps:
+                saved_map = {
+                    str(x.get("date", "")): safe_float(x.get("hours", 0.0), 0.0)
+                    for x in (cached.get("day_hours", []) if isinstance(cached.get("day_hours"), list) else [])
+                    if isinstance(x, dict) and x.get("date")
+                }
+                for dt in date_range(cached_ps, cached_pe):
+                    st.session_state[f"hr_{dt}"] = saved_map.get(dt, 0.0)
+                st.session_state["autofill_hours_map"] = {
+                    dt: st.session_state.get(f"hr_{dt}", 0.0) for dt in date_range(cached_ps, cached_pe)
+                }
+        st.session_state.manual_prefill_loaded = True
+
+    if st.session_state.entry_mode == "Manual Entry":
+        if st.button("Clear Saved Step 1 Values"):
+            clear_manual_step1_prefill()
+            reset_step1_form_state()
+            st.session_state["employee_name"] = ""
+            st.session_state["vendor"] = ""
+            st.session_state["company"] = ""
+            st.session_state["duration"] = "Weekly"
+            st.session_state["period_start"] = None
+            st.session_state["period_end"] = None
+            st.session_state.manual_prefill_loaded = True
+            st.success("Saved Step 1 values cleared.")
+            st.rerun()
+
     if st.session_state.entry_mode == "Auto-Fill from Uploaded Timesheet":
         st.info("Upload a reference timesheet to auto-fill fields. You can edit values before final validation.")
         autofill_file = st.file_uploader(
-            "Auto-Fill Source (PDF/Image)",
-            type=["pdf", "png", "jpg", "jpeg"],
+            "Auto-Fill Source (PDF/Image/Text/Doc)",
+            type=["pdf", "png", "jpg", "jpeg", "txt", "doc", "docx"],
             key=f"autofill_{st.session_state.autofill_uploader_key}",
         )
         if autofill_file:
@@ -3076,24 +3267,25 @@ def main() -> None:
 
     st.subheader("Step 2 - Validate and Decide")
     if st.session_state.entry_mode == "Manual Entry":
-        st.caption("Upload a timesheet file and process it.")
-        manual_file = st.file_uploader(
-            "Upload PDF/Image",
-            type=["pdf", "png", "jpg", "jpeg"],
+        st.caption("Upload one or more timesheet files and process together.")
+        manual_files = st.file_uploader(
+            "Upload PDF/Image/Text/Doc file(s)",
+            type=["pdf", "png", "jpg", "jpeg", "txt", "doc", "docx"],
+            accept_multiple_files=True,
             key=f"uploader_{st.session_state.uploader_key}",
         )
         process_clicked = st.button("Process Next", type="primary")
         if process_clicked:
-            if not manual_file:
-                st.warning("Please upload a file first.")
+            if not manual_files:
+                st.warning("Please upload at least one file first.")
                 return
-            file_bytes = manual_file.getvalue()
-            file_name = manual_file.name
-            fingerprint = hashlib.sha256(file_bytes).hexdigest()
+            selected_files = []
+            for f in manual_files:
+                b = f.getvalue()
+                fp = hashlib.sha256(b).hexdigest()
+                selected_files.append({"name": f.name, "bytes": b, "fingerprint": fp})
         else:
-            file_bytes = None
-            file_name = ""
-            fingerprint = None
+            selected_files = []
     else:
         st.caption("Process the file already uploaded in Step 1.")
         process_clicked = st.button("Process Next", type="primary")
@@ -3104,37 +3296,323 @@ def main() -> None:
             file_bytes = st.session_state.source_file_bytes
             file_name = st.session_state.source_file_name or "source_upload"
             fingerprint = st.session_state.source_file_fingerprint or hashlib.sha256(file_bytes).hexdigest()
+            selected_files = [{"name": file_name, "bytes": file_bytes, "fingerprint": fingerprint}]
         else:
-            file_bytes = None
-            file_name = ""
-            fingerprint = None
+            selected_files = []
 
-    if process_clicked and file_bytes is not None and fingerprint is not None:
-        # If a different file is currently selected, discard prior processed snapshot first.
-        current_result_fp = None
-        if isinstance(st.session_state.get("validation_result"), dict):
-            current_result_fp = st.session_state["validation_result"].get("processed_fingerprint")
-        if current_result_fp and current_result_fp != fingerprint:
-            st.session_state.validation_result = None
-            st.session_state.last_upload_fingerprint = None
+    if process_clicked and selected_files:
+        fingerprint = hashlib.sha256(
+            "||".join(sorted(x["fingerprint"] for x in selected_files)).encode("utf-8")
+        ).hexdigest()
+        step1 = {
+            "employee_name": employee_name,
+            "vendor": vendor,
+            "company": company,
+            "duration": duration,
+            "period_start": period_start.isoformat() if isinstance(period_start, date) else "",
+            "period_end": period_end.isoformat() if isinstance(period_end, date) else "",
+            "day_hours": day_hours,
+        }
+        if st.session_state.entry_mode == "Manual Entry":
+            save_manual_step1_prefill(step1)
+        submission_hash = build_submission_hash(step1, fingerprint)
+        # Always process on every Process Next click, even when Step1/files are unchanged.
+        st.session_state.validation_result = None
+        progress = st.progress(5, text="Reading file...")
+        step1_ps_text = period_start.isoformat() if isinstance(period_start, date) else ""
+        step1_pe_text = period_end.isoformat() if isinstance(period_end, date) else ""
+        hints = {
+            "duration": duration,
+            "period_start": step1_ps_text,
+            "period_end": step1_pe_text,
+        }
+        forced_manual_reasons: List[str] = []
+        per_file_status: List[Dict[str, Any]] = []
+        per_file_included_hours_total = 0.0
+        is_manual_multi = st.session_state.entry_mode == "Manual Entry" and len(selected_files) > 1
 
-        if st.session_state.last_upload_fingerprint != fingerprint:
-            progress = st.progress(5, text="Reading file...")
-            step1 = {
-                "employee_name": employee_name,
-                "vendor": vendor,
-                "company": company,
-                "duration": duration,
-                "period_start": period_start.isoformat() if isinstance(period_start, date) else "",
-                "period_end": period_end.isoformat() if isinstance(period_end, date) else "",
-                "day_hours": day_hours,
-            }
-            submission_hash = build_submission_hash(step1, fingerprint)
-            if st.session_state.enable_duplicate_check and duplicate_submission_exists(submission_hash):
-                st.warning("Duplicate submission detected for the same employee/period/file. Skipping re-processing.")
+        if is_manual_multi:
+            if not employee_name.strip() or not step1_ps_text or not step1_pe_text:
+                st.warning("For multi-file Manual Entry, fill Employee Name, Period Start, and Period End in Step 1 first.")
                 return
-            step1_ps_text = period_start.isoformat() if isinstance(period_start, date) else ""
-            step1_pe_text = period_end.isoformat() if isinstance(period_end, date) else ""
+            progress.progress(20, text="Running extraction for uploaded files...")
+            step1_start = parse_iso_date_optional(step1_ps_text)
+            step1_end = parse_iso_date_optional(step1_pe_text)
+            step1_emp_canon = canonical_person_name(employee_name)
+            step1_vendor_canon = normalize_text(vendor)
+            step1_company_canon = normalize_text(company)
+            merged = default_normalized()
+            merged["employee_name"] = employee_name
+            merged["vendor"] = vendor
+            merged["company"] = company
+            merged["duration"] = duration
+            merged["period_start"] = ""
+            merged["period_end"] = ""
+            merged_hours: Dict[str, float] = {}
+            observed_hours_all_files: Dict[str, float] = {}
+            extracted_dates_all_files: set[str] = set()
+            excluded_day_entries: List[Dict[str, Any]] = []
+            overlap_conflicts: List[Dict[str, Any]] = []
+            missing_critical_files: List[str] = []
+            approval_missing_files: List[str] = []
+            merged_ocr_parts: List[str] = []
+            precheck_issues: List[str] = []
+            quality_issues: List[str] = []
+            conf_vals: List[float] = []
+            approver_candidates: List[str] = []
+            any_approval_signal = False
+            table_columns_accum: List[str] = []
+            headers_accum: List[str] = []
+            file_fp_counts = Counter(x.get("fingerprint", "") for x in selected_files)
+            consumed_fp: Dict[str, int] = {}
+
+            for idx, file_obj in enumerate(selected_files, start=1):
+                extraction_i = extract_and_normalize(file_obj["bytes"], file_obj["name"], hints=hints)
+                normalized_i = extraction_i.get("normalized", {}) if isinstance(extraction_i, dict) else {}
+                file_ext = os.path.splitext(str(file_obj.get("name", "")).lower())[1]
+                explicit_dates = (
+                    extract_explicit_dates_from_text(extraction_i.get("ocr_text", ""))
+                    if file_ext in {".txt", ".doc", ".docx"}
+                    else set()
+                )
+                precheck_issues.extend(extraction_i.get("meta", {}).get("prevalidation", {}).get("issues", []))
+                quality_issues.extend(extraction_i.get("meta", {}).get("quality_validation", {}).get("issues", []))
+                merged_ocr_parts.append((extraction_i.get("ocr_text") or "").strip())
+                conf_vals.append(safe_float(normalized_i.get("confidence", 0.0), 0.0))
+
+                file_notes: List[str] = []
+                critical_missing = []
+                for crit_key in ["employee_name", "vendor", "company"]:
+                    crit_val = normalize_text(str(normalized_i.get(crit_key, "") or ""))
+                    if not crit_val:
+                        critical_missing.append(crit_key)
+                if critical_missing:
+                    missing_critical_files.append(file_obj["name"])
+                    file_notes.append(f"Missing fields: {', '.join(critical_missing)}")
+
+                file_fp = str(file_obj.get("fingerprint", "") or "")
+                duplicate_upload = False
+                if file_fp:
+                    consumed_fp[file_fp] = consumed_fp.get(file_fp, 0) + 1
+                    if file_fp_counts.get(file_fp, 0) > 1 and consumed_fp[file_fp] > 1:
+                        duplicate_upload = True
+                        file_notes.append("Duplicate file upload")
+
+                mismatched_with_step1: List[str] = []
+                extracted_emp = str(normalized_i.get("employee_name", "") or "")
+                extracted_vendor = str(normalized_i.get("vendor", "") or "")
+                extracted_company = str(normalized_i.get("company", "") or "")
+                if step1_emp_canon and canonical_person_name(extracted_emp) and canonical_person_name(extracted_emp) != step1_emp_canon:
+                    mismatched_with_step1.append(
+                        f"employee_name (Step1='{format_person_name_display(employee_name)}', File='{format_person_name_display(extracted_emp)}')"
+                    )
+                if step1_vendor_canon and normalize_text(extracted_vendor) and normalize_text(extracted_vendor) != step1_vendor_canon:
+                    mismatched_with_step1.append(
+                        f"vendor (Step1='{vendor}', File='{extracted_vendor}')"
+                    )
+                if step1_company_canon and normalize_text(extracted_company) and normalize_text(extracted_company) != step1_company_canon:
+                    mismatched_with_step1.append(
+                        f"company (Step1='{company}', File='{extracted_company}')"
+                    )
+                if mismatched_with_step1:
+                    file_notes.extend(mismatched_with_step1)
+
+                approved_text = normalize_text(str(normalized_i.get("approved", "") or ""))
+                approver_name_text = str(normalized_i.get("approver_name", "") or "").strip()
+                has_named_approver = bool(approver_name_text) and is_probable_person_name(approver_name_text)
+                generic_approval_tokens = {
+                    "",
+                    "approved",
+                    "approved by",
+                    "signature",
+                    "signed",
+                    "yes",
+                    "yes/signature",
+                    "no",
+                    "none",
+                    "na",
+                    "n/a",
+                    "rejected",
+                    "declined",
+                    "pending",
+                }
+                has_specific_approval_value = approved_text not in generic_approval_tokens
+                approval_found = has_named_approver or has_specific_approval_value
+
+                extracted_rows = normalized_i.get("day_hours", []) if isinstance(normalized_i.get("day_hours"), list) else []
+                contributes_to_range = False
+                included_hours_for_file = 0.0
+                merged_dates_added_from_file: List[str] = []
+                for row in extracted_rows:
+                    if not isinstance(row, dict):
+                        continue
+                    dt_text = str(row.get("date", "") or "")
+                    dt_obj = parse_iso_date_optional(dt_text)
+                    if not dt_obj:
+                        continue
+                    if explicit_dates and dt_text not in explicit_dates:
+                        continue
+                    extracted_dates_all_files.add(dt_text)
+                    if step1_start and step1_end and (dt_obj < step1_start or dt_obj > step1_end):
+                        continue
+                    contributes_to_range = True
+                    hour_val = safe_float(row.get("hours", 0.0), 0.0)
+                    if dt_text not in observed_hours_all_files:
+                        observed_hours_all_files[dt_text] = hour_val
+                    if (not duplicate_upload) and (not mismatched_with_step1) and (not critical_missing) and approval_found:
+                        if dt_text in merged_hours:
+                            if abs(merged_hours[dt_text] - hour_val) > APP_CONFIG["hour_tolerance"]:
+                                overlap_conflicts.append(
+                                    {
+                                        "date": dt_text,
+                                        "hours_existing": merged_hours[dt_text],
+                                        "hours_new": hour_val,
+                                        "file": file_obj["name"],
+                                    }
+                                )
+                                file_notes.append(f"Overlap conflict on {dt_text}")
+                        else:
+                            merged_hours[dt_text] = hour_val
+                            included_hours_for_file += hour_val
+                            merged_dates_added_from_file.append(dt_text)
+                    else:
+                        excluded_day_entries.append(
+                            {
+                                "date": dt_text,
+                                "hours": round(hour_val, 2),
+                                "file": file_obj["name"],
+                                "reason": (
+                                    "Excluded due missing required fields"
+                                    if critical_missing
+                                    else (
+                                        "Excluded due approval missing"
+                                        if not approval_found
+                                        else "Excluded due Step 1 field mismatch"
+                                    )
+                                ),
+                            }
+                        )
+
+                if contributes_to_range and (not mismatched_with_step1) and not approval_found:
+                    approval_missing_files.append(file_obj["name"])
+                    file_notes.append("Approval signal missing for contributing file")
+
+                extracted_ps = str(normalized_i.get("period_start", "") or "")
+                extracted_pe = str(normalized_i.get("period_end", "") or "")
+                if explicit_dates:
+                    parsed_explicit = [parse_iso_date_optional(x) for x in explicit_dates]
+                    parsed_explicit = [d for d in parsed_explicit if d is not None]
+                    if parsed_explicit:
+                        extracted_ps = min(parsed_explicit).isoformat()
+                        extracted_pe = max(parsed_explicit).isoformat()
+                        extracted_dates_all_files.update(d.isoformat() for d in parsed_explicit)
+                else:
+                    ps_any = parse_iso_date_optional(extracted_ps)
+                    pe_any = parse_iso_date_optional(extracted_pe)
+                    if ps_any:
+                        extracted_dates_all_files.add(ps_any.isoformat())
+                    if pe_any:
+                        extracted_dates_all_files.add(pe_any.isoformat())
+                if (not contributes_to_range) and step1_start and step1_end:
+                    ps_obj = parse_iso_date_optional(extracted_ps)
+                    pe_obj = parse_iso_date_optional(extracted_pe)
+                    if ps_obj and pe_obj and ps_obj <= step1_end and pe_obj >= step1_start:
+                        contributes_to_range = True
+                        if (not mismatched_with_step1) and not approval_found:
+                            approval_missing_files.append(file_obj["name"])
+                            file_notes.append("Approval signal missing for contributing file")
+                if not contributes_to_range:
+                    file_notes.append("Outside selected Step 1 date range")
+                excluded_from_merge = (
+                    duplicate_upload
+                    or bool(critical_missing)
+                    or bool(mismatched_with_step1)
+                    or (not contributes_to_range)
+                    or (contributes_to_range and not approval_found)
+                    or any("Overlap conflict" in n for n in file_notes)
+                )
+                if (not excluded_from_merge) and approval_found:
+                    any_approval_signal = True
+                    if approver_name_text and is_probable_person_name(approver_name_text):
+                        approver_candidates.append(approver_name_text)
+                if excluded_from_merge:
+                    for dt_added in merged_dates_added_from_file:
+                        merged_hours.pop(dt_added, None)
+                    included_hours_for_file = 0.0
+                per_file_included_hours_total += included_hours_for_file
+                if isinstance(normalized_i.get("headers"), list):
+                    headers_accum.extend(str(x) for x in normalized_i.get("headers") if x is not None)
+                if isinstance(normalized_i.get("table_columns"), list):
+                    table_columns_accum.extend(str(x) for x in normalized_i.get("table_columns") if x is not None)
+
+                per_file_status.append(
+                    {
+                        "File Name": file_obj["name"],
+                        "Extracted Period": f"{extracted_ps or '-'} to {extracted_pe or '-'}",
+                        "Included in Merged Total": "No" if excluded_from_merge else "Yes",
+                        "Included Hours": round(included_hours_for_file, 2),
+                        "Status": "Needs Review" if file_notes else "OK",
+                        "Details": "; ".join(file_notes) if file_notes else "No issues",
+                    }
+                )
+
+            merged["headers"] = headers_accum
+            merged["table_columns"] = table_columns_accum
+            included_dates = sorted(parse_iso_date_optional(dt) for dt in merged_hours.keys())
+            included_dates = [d for d in included_dates if d is not None]
+            parsed_all_dates = sorted(d for d in (parse_iso_date_optional(x) for x in extracted_dates_all_files) if d is not None)
+            if included_dates:
+                # For comparison, period should reflect the included merged set.
+                merged["period_start"] = included_dates[0].isoformat()
+                merged["period_end"] = included_dates[-1].isoformat()
+            elif parsed_all_dates:
+                # If nothing was included, fall back to all observed extracted dates.
+                merged["period_start"] = parsed_all_dates[0].isoformat()
+                merged["period_end"] = parsed_all_dates[-1].isoformat()
+            else:
+                merged["period_start"] = step1_ps_text
+                merged["period_end"] = step1_pe_text
+            merged["day_hours"] = [{"date": dt, "hours": round(hr, 2)} for dt, hr in sorted(merged_hours.items())]
+            per_file_status.sort(
+                key=lambda r: (
+                    parse_iso_date_optional(
+                        str((r.get("Extracted Period", "") or "").split(" to ")[0]).strip()
+                    )
+                    or date.max
+                )
+            )
+            merged["observed_day_hours_all_files"] = [
+                {"date": dt, "hours": round(hr, 2)} for dt, hr in sorted(observed_hours_all_files.items())
+            ]
+            merged["excluded_day_hours"] = excluded_day_entries
+            merged["total_hours"] = round(sum(merged_hours.values()), 2) if merged_hours else 0.0
+            merged["confidence"] = round((sum(conf_vals) / len(conf_vals)), 3) if conf_vals else 0.0
+            merged["approver_name"] = approver_candidates[0] if approver_candidates else ""
+            merged["approved"] = "yes/signature" if any_approval_signal else ""
+            extraction = {
+                "normalized": merged,
+                "raw": {"multi_file": True, "file_count": len(selected_files)},
+                "meta": {
+                    "mode": "multi_file_manual",
+                    "file_count": len(selected_files),
+                    "prevalidation": {"issues": precheck_issues},
+                    "quality_validation": {"issues": quality_issues},
+                    "per_file_status": per_file_status,
+                },
+                "ocr_text": "\n\n".join(x for x in merged_ocr_parts if x),
+            }
+            if missing_critical_files:
+                forced_manual_reasons.append(
+                    f"Missing critical fields in file(s): {', '.join(sorted(set(missing_critical_files)))}"
+                )
+            if overlap_conflicts:
+                forced_manual_reasons.append("Overlap conflict found: same date has different hours in multiple files")
+            if approval_missing_files:
+                forced_manual_reasons.append(
+                    f"Approval missing in contributing file(s): {', '.join(sorted(set(approval_missing_files)))}"
+                )
+        else:
+            file_obj = selected_files[0]
             preview_norm = (
                 st.session_state.get("autofill_extraction_preview", {}).get("normalized", {})
                 if isinstance(st.session_state.get("autofill_extraction_preview"), dict)
@@ -3146,8 +3624,6 @@ def main() -> None:
                 st.session_state.entry_mode == "Auto-Fill from Uploaded Timesheet"
                 and st.session_state.get("autofill_extraction_preview") is not None
                 and st.session_state.get("autofill_last_fingerprint") == fingerprint
-                # Reuse only when Step1 period still matches the snapshot period.
-                # If user adjusted period/duration, re-run extraction with hints.
                 and step1_ps_text == preview_ps_text
                 and step1_pe_text == preview_pe_text
             )
@@ -3156,76 +3632,74 @@ def main() -> None:
                 extraction = st.session_state.autofill_extraction_preview
             else:
                 progress.progress(30, text="Running Textract...")
-                extraction = extract_and_normalize(
-                    file_bytes,
-                    file_name,
-                    hints={
-                        "duration": duration,
-                        "period_start": period_start.isoformat() if isinstance(period_start, date) else "",
-                        "period_end": period_end.isoformat() if isinstance(period_end, date) else "",
-                    },
-                )
-            progress.progress(70, text="Comparing with Step 1...")
-            extracted = extraction["normalized"]
-            comparison = compare_data(step1, extracted)
-            p_key = pattern_key(duration, day_hours)
-            t_hash = template_hash(extracted)
-            streak = get_streak(employee_name, vendor, company, t_hash, p_key)
-            confidence = safe_float(extracted.get("confidence", 0.0), 0.0)
-            decision, approval_type, reasons = decide(comparison, confidence, streak)
+                extraction = extract_and_normalize(file_obj["bytes"], file_obj["name"], hints=hints)
             precheck_issues = extraction.get("meta", {}).get("prevalidation", {}).get("issues", [])
             quality_issues = extraction.get("meta", {}).get("quality_validation", {}).get("issues", [])
-            all_matched = not comparison.get("mismatches")
-            if precheck_issues:
-                decision = "MANUAL_REVIEW"
-                approval_type = "MANUAL_REVIEW"
-                reasons = [f"Pre-validation: {x}" for x in precheck_issues]
-            elif quality_issues and not all_matched:
-                # Route to manual only when quality issue likely impacted extraction/comparison.
-                decision = "MANUAL_REVIEW"
-                approval_type = "MANUAL_REVIEW"
-                reasons = reasons + [f"Quality issue: {x}" for x in quality_issues]
-            # Business rule: if everything matches, always auto approve.
-            if all_matched:
-                decision = "AUTO_APPROVE"
-                approval_type = "AUTO_APPROVE"
-                reasons = []
-            reason_codes = build_reason_codes(decision, comparison, confidence, extraction.get("meta", {}))
-            progress.progress(100, text="Completed")
-            st.session_state.validation_result = {
-                "step1": step1,
-                "extraction": extraction,
-                "extracted": extracted,
-                "comparison": comparison,
-                "pattern_key": p_key,
-                "template_hash": t_hash,
-                "streak": streak,
-                "decision": decision,
-                "approval_type": approval_type,
-                "reasons": reasons,
-                "reason_codes": reason_codes,
-                "submission_hash": submission_hash,
-                "processed_fingerprint": fingerprint,
-            }
-            st.session_state.last_upload_fingerprint = fingerprint
-            if decision != "MANUAL_REVIEW":
-                log_history(
-                    employee_name,
-                    streak,
-                    t_hash,
-                    p_key,
-                    submission_hash,
-                    step1,
-                    extracted,
-                    comparison,
-                    decision,
-                    approval_type,
-                    reasons,
-                    reason_codes,
-                    extraction["meta"],
-                )
-        else:
-            st.info("This file was already processed. Click OK/Submit decision first, or upload a different file.")
+
+        progress.progress(70, text="Comparing with Step 1...")
+        extracted = extraction["normalized"]
+        comparison = compare_data(step1, extracted)
+        p_key = pattern_key(duration, day_hours)
+        t_hash = template_hash(extracted)
+        streak = get_streak(employee_name, vendor, company, t_hash, p_key)
+        confidence = safe_float(extracted.get("confidence", 0.0), 0.0)
+        decision, approval_type, reasons = decide(comparison, confidence, streak)
+        all_matched = not comparison.get("mismatches")
+        if precheck_issues:
+            decision = "MANUAL_REVIEW"
+            approval_type = "MANUAL_REVIEW"
+            reasons = [f"Pre-validation: {x}" for x in precheck_issues]
+        elif quality_issues and not all_matched:
+            # Route to manual only when quality issue likely impacted extraction/comparison.
+            decision = "MANUAL_REVIEW"
+            approval_type = "MANUAL_REVIEW"
+            reasons = reasons + [f"Quality issue: {x}" for x in quality_issues]
+        if forced_manual_reasons:
+            decision = "MANUAL_REVIEW"
+            approval_type = "MANUAL_REVIEW"
+            reasons = reasons + forced_manual_reasons
+        # Business rule: if everything matches, always auto approve.
+        if all_matched and not forced_manual_reasons and not precheck_issues and not quality_issues:
+            decision = "AUTO_APPROVE"
+            approval_type = "AUTO_APPROVE"
+            reasons = []
+        reason_codes = build_reason_codes(decision, comparison, confidence, extraction.get("meta", {}))
+        progress.progress(100, text="Completed")
+        st.session_state.validation_result = {
+            "step1": step1,
+            "extraction": extraction,
+            "extracted": extracted,
+            "comparison": comparison,
+            "pattern_key": p_key,
+            "template_hash": t_hash,
+            "streak": streak,
+            "decision": decision,
+            "approval_type": approval_type,
+            "reasons": reasons,
+            "reason_codes": reason_codes,
+            "submission_hash": submission_hash,
+            "processed_fingerprint": fingerprint,
+            "per_file_status": per_file_status,
+            "per_file_included_hours_total": round(per_file_included_hours_total, 2),
+        }
+        st.session_state.last_upload_fingerprint = fingerprint
+        st.session_state.last_submission_hash = submission_hash
+        if decision != "MANUAL_REVIEW":
+            log_history(
+                employee_name,
+                streak,
+                t_hash,
+                p_key,
+                submission_hash,
+                step1,
+                extracted,
+                comparison,
+                decision,
+                approval_type,
+                reasons,
+                reason_codes,
+                extraction["meta"],
+            )
 
     result = st.session_state.validation_result
     if result:
@@ -3257,6 +3731,33 @@ def main() -> None:
                 st.write({"confidence_breakdown": extracted.get("confidence_breakdown")})
             if extracted.get("error"):
                 st.error(user_friendly_error(extracted["error"]))
+
+        per_file_status = result.get("per_file_status", []) if isinstance(result, dict) else []
+        if (
+            (not per_file_status)
+            and isinstance(extraction, dict)
+            and isinstance(extraction.get("meta", {}), dict)
+            and isinstance(extraction.get("meta", {}).get("per_file_status"), list)
+        ):
+            per_file_status = extraction.get("meta", {}).get("per_file_status", [])
+        if st.session_state.entry_mode == "Manual Entry":
+            st.subheader("Per-file Processing Status")
+            st.caption(
+                "Green row = included in merged total, Red row = excluded. Included Hours are the hours counted from that file."
+            )
+            if per_file_status:
+                per_file_df = pd.DataFrame(per_file_status)
+                def _highlight_row(row: pd.Series) -> List[str]:
+                    bg = "#e8f5e9" if str(row.get("Included in Merged Total", "")) == "Yes" else "#ffebee"
+                    return [f"background-color: {bg}"] * len(row)
+                st.dataframe(
+                    per_file_df.style.apply(_highlight_row, axis=1).format({"Included Hours": "{:.2f}"}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.caption(f"Total Included Hours: {safe_float(result.get('per_file_included_hours_total', 0.0), 0.0):.2f}")
+            else:
+                st.info("No per-file rows available for this run.")
 
         st.subheader("Comparison")
         fields = ["employee_name", "vendor", "company", "period_start", "period_end", "approved", "total_hours"]
@@ -3302,6 +3803,10 @@ def main() -> None:
             st.dataframe(comparison["mismatches"]["day_hours"], use_container_width=True)
         else:
             st.success("All day-wise hours matched.")
+
+        if comparison.get("excluded_day_hours"):
+            st.caption("These uploaded dates were excluded from merged total (for example, Step 1 field mismatch in that file).")
+            st.dataframe(comparison.get("excluded_day_hours", []), use_container_width=True)
 
         with st.expander("Decision", expanded=False):
             st.write(

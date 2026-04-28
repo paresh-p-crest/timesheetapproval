@@ -1,0 +1,9 @@
+DAILY TIMESHEET
+Employee Name: John Carter
+Vendor: Apex Staffing LLC
+Company: CapitalOne
+Time Duration: Daily
+Work Date: 2026-01-08
+Day: Thursday
+Hours: 9.00
+Approved By: Sarah Mitchell
