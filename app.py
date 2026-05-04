@@ -2406,10 +2406,6 @@ def clear_all_history() -> None:
 def decide(comparison: Dict[str, Any], confidence: float, streak: int) -> Tuple[str, str, List[str]]:
     reasons: List[str] = []
 
-    # If explicit approval status indicates rejection/pending, never trusted-auto-approve.
-    if comparison.get("mismatches", {}).get("approved"):
-        return "MANUAL_REVIEW", "MANUAL_REVIEW", ["Approval status indicates not approved"]
-
     if not comparison["mismatches"] and comparison["critical_ok"]:
         return "AUTO_APPROVE", "AUTO_APPROVE", reasons
     # Streak is updated only after manual decision is submitted.
@@ -3799,11 +3795,25 @@ def main() -> None:
             decision = "MANUAL_REVIEW"
             approval_type = "MANUAL_REVIEW"
             reasons = reasons + forced_manual_reasons
+        # Trusted pattern override (single/multi): after enough manual approvals
+        # of same pattern, allow auto-approve for recurring non-critical/manual-only reasons.
+        # Keep a hard stop for explicit negative approval statuses.
+        trusted_trigger = max(APP_CONFIG["trusted_streak_threshold"] - 1, 0)
+        approved_norm = normalize_text(str(extracted.get("approved", "") or ""))
+        explicit_negative_approval = approved_norm in {"rejected", "declined", "pending"}
+        if streak >= trusted_trigger and not explicit_negative_approval:
+            decision = "AUTO_APPROVE_TRUSTED"
+            approval_type = "AUTO_APPROVE_TRUSTED_TEMPLATE"
+            reasons = [f"Trusted auto-approve at threshold {APP_CONFIG['trusted_streak_threshold']}"]
         # Business rule: if everything matches, always auto approve.
         if all_matched and not forced_manual_reasons and not precheck_issues and not quality_issues:
             decision = "AUTO_APPROVE"
             approval_type = "AUTO_APPROVE"
             reasons = []
+        display_streak = streak
+        if decision == "AUTO_APPROVE_TRUSTED":
+            # User-facing streak should reflect threshold hit on this run.
+            display_streak = max(streak + 1, APP_CONFIG["trusted_streak_threshold"])
         reason_codes = build_reason_codes(decision, comparison, confidence, extraction.get("meta", {}))
         progress.progress(100, text="Completed")
         st.session_state.validation_result = {
@@ -3813,7 +3823,7 @@ def main() -> None:
             "comparison": comparison,
             "pattern_key": p_key,
             "template_hash": t_hash,
-            "streak": streak,
+            "streak": display_streak,
             "decision": decision,
             "approval_type": approval_type,
             "reasons": reasons,
@@ -3828,7 +3838,7 @@ def main() -> None:
         if decision != "MANUAL_REVIEW":
             log_history(
                 employee_name,
-                streak,
+                display_streak,
                 t_hash,
                 p_key,
                 submission_hash,
