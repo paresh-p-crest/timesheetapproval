@@ -125,3 +125,112 @@ Create endpoints:
 - Full audit history visible per submission
 
 Now implement this POC with clean, testable code and include a short explanation of architecture decisions.
+
+
+=======
+SliceHRMS Timesheet Approval – Master Continuation Prompt
+You are helping maintain a Streamlit-based timesheet validation app at:
+
+D:\AWS\AWS Projects\SliceHRMS\timesheetapproval
+Main file: app.py
+Project Purpose
+Validate uploaded timesheets (PDF/IMG/TXT/DOC/DOCX) against Step 1 manual/auto-filled data, then route to:
+
+AUTO_APPROVE
+AUTO_APPROVE_TRUSTED
+MANUAL_REVIEW
+with strong auditability (Validation History), per-file status for multi-upload, and robust non-breaking behavior.
+
+Core Functional Modes
+1) Auto-Fill from Uploaded Timesheet
+Single-file mode.
+Extracts fields + day-hours from uploaded file and pre-fills Step 1.
+User can manually edit before Process Next.
+2) Manual Entry
+Supports multi-file upload and combined validation.
+Step 1 is user-entered (name/vendor/company/duration/period/day-hours).
+Multi-file merge logic applies strict include/exclude rules per file.
+Required Fields and Matching Behavior
+Critical fields:
+
+employee_name
+vendor
+company
+Rules:
+
+Missing required critical field in extracted data -> Needs Review / exclusion from merged total.
+Compare employee/vendor/company canonically (normalized).
+Approval required for included/contributing files (strict rules).
+Multi-File Processing Logic (Manual Mode)
+Each uploaded file gets a status row in Per-file Processing Status with columns:
+
+File Name
+Extracted Period
+Included in Merged Total
+Included Hours
+Status
+Details
+Row coloring:
+
+Green = included
+Red = excluded
+Inclusion/Exclusion principles
+A file/date entry is excluded when applicable:
+
+Duplicate upload/content
+Duplicate same date+same hours (redundant copy)
+Overlap conflict (same date, different hours) -> both conflicting files should be excluded
+Missing required fields
+Step 1 field mismatch
+Outside selected Step 1 date range
+Missing approval for contributing file
+Period behavior
+Comparison can treat subset dates within Step 1 range as acceptable in defined coverage scenario.
+UI can show note like within selected range.
+Important Existing UX/Behavior Requirements
+Always process on every Process Next click (no same-input blocking).
+Preserve all existing PDF/IMG logic (no regressions).
+TXT/DOC/DOCX support exists mainly for fast testing.
+Manual mode should show per-file table even for a single uploaded file.
+Manual Step 1 prefill is persisted and can be cleared via button.
+Trusted Auto-Approve (Streak-Based)
+Settings page has threshold (e.g., 3):
+
+After enough manual approvals of same pattern/template, next similar case can be AUTO_APPROVE_TRUSTED.
+Keep explicit negative approvals blocked (rejected/declined/pending).
+History streak display should reflect threshold-hit UX expectations.
+Current Priority Rule (Must Enforce)
+For auto-approval decision quality:
+
+Day-wise exact date-hour match should dominate, not just total hours.
+If total matches but date-wise hours are swapped/misaligned (example: day5=8/day6=7 vs day5=7/day6=8), this is Mismatch and should go manual.
+(Only allow missing dates when expected hours are zero and existing project logic explicitly allows that scenario.)
+
+Restrictions / Guardrails
+Do not break existing working behavior for PDF/IMG extraction and previously fixed templates.
+Prefer additive, scoped fixes; avoid broad refactors.
+Preserve all current business rules unless explicitly changed.
+Keep UI user-friendly:
+avoid technical jargon in table details,
+show reasons clearly in Details.
+Validate after edits:
+python -m py_compile app.py
+lints clean.
+Avoid removing existing fallback logic unless clearly obsolete and safe.
+Never use destructive git commands.
+Known Areas to Inspect First in app.py
+compare_data(...)
+Multi-file merge/inclusion loop in Step 2 processing
+Decision path near decide(...) + post-decision overrides
+Per-file status table build/render
+Streak/history updates and logging
+Manual prefill load/save/clear helpers
+Output Style Expected from Assistant
+When implementing:
+
+Explain what changed in plain language.
+Mention what was kept unchanged to avoid regression.
+Include verification result (compile/lint).
+If encountering rule conflict, ask user with concrete scenario before changing behavior.
+
+============

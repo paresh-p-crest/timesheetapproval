@@ -75,6 +75,7 @@ def init_db() -> None:
         create table if not exists validation_history (
             id integer primary key autoincrement,
             created_at text not null,
+            employee_id text,
             employee_name text,
             streak_value integer default 0,
             template_hash text,
@@ -99,9 +100,28 @@ def init_db() -> None:
         )
         """
     )
+    conn.execute(
+        """
+        create table if not exists learning_approvals (
+            employee_id text not null,
+            vendor text not null,
+            company text not null,
+            template_hash text not null,
+            pattern_key text not null,
+            mismatch_signature text not null,
+            last_answer text not null default '',
+            last_question text not null default '',
+            streak_count integer not null default 0,
+            updated_at text not null,
+            primary key (employee_id, vendor, company, template_hash, pattern_key, mismatch_signature)
+        )
+        """
+    )
     existing_cols = {row[1] for row in conn.execute("pragma table_info(validation_history)").fetchall()}
     if "employee_name" not in existing_cols:
         conn.execute("alter table validation_history add column employee_name text")
+    if "employee_id" not in existing_cols:
+        conn.execute("alter table validation_history add column employee_id text")
     if "streak_value" not in existing_cols:
         conn.execute("alter table validation_history add column streak_value integer default 0")
     if "template_hash" not in existing_cols:
@@ -112,6 +132,9 @@ def init_db() -> None:
         conn.execute("alter table validation_history add column submission_hash text")
     if "reason_codes_json" not in existing_cols:
         conn.execute("alter table validation_history add column reason_codes_json text")
+    learning_cols = {row[1] for row in conn.execute("pragma table_info(learning_approvals)").fetchall()}
+    if "last_question" not in learning_cols:
+        conn.execute("alter table learning_approvals add column last_question text default ''")
     conn.execute(
         """
         insert into app_settings(key, value)
@@ -1352,9 +1375,21 @@ def _extract_project_grid_daily_totals_from_text(normalized: Dict[str, Any], ocr
     # Typical work-week counts in these reports (Mon-Fri, sometimes +Sat/+Sun)
     expected_lengths = {5, 6, 7, len(period_dates)}
     lines = [ln.strip() for ln in (ocr_text or "").splitlines() if ln.strip()]
+    non_work_markers = [
+        "unpaid",
+        "time off",
+        "pto",
+        "leave",
+        "holiday",
+    ]
+    def is_non_work_line(text: str) -> bool:
+        t = normalize_text(text or "")
+        return any(m in t for m in non_work_markers)
     candidates: List[List[float]] = []
 
     for ln in lines:
+        if is_non_work_line(ln):
+            continue
         vals = [safe_float(m.group(1), None) for m in re.finditer(r"\b(\d{1,2}(?:\.\d{1,2})?)\b", ln)]
         vals = [v for v in vals if v is not None]
         if not vals:
@@ -1372,7 +1407,8 @@ def _extract_project_grid_daily_totals_from_text(normalized: Dict[str, Any], ocr
     if not candidates:
         # Second-pass fallback: OCR/PDF text can split row values into separate lines.
         # Scan rolling windows of decimal hour tokens and pick the most plausible day-total series.
-        token_vals = [safe_float(m.group(1), None) for m in re.finditer(r"\b(\d{1,2}\.\d{2})\b", ocr_text or "")]
+        filtered_text = "\n".join(ln for ln in lines if not is_non_work_line(ln))
+        token_vals = [safe_float(m.group(1), None) for m in re.finditer(r"\b(\d{1,2}\.\d{2})\b", filtered_text)]
         token_vals = [float(v) for v in token_vals if v is not None and 0 <= v <= 16]
         if token_vals:
             # Typical workdays in period (Mon-Fri); fallback to 5..7.
@@ -1495,7 +1531,7 @@ def _apply_semi_monthly_weekend_zero_fix(normalized: Dict[str, Any], ocr_text: s
     normalized["total_hours"] = round(sum(x["hours"] for x in out), 2)
 
 
-def _apply_weekly_mon_fri_alignment_fix(normalized: Dict[str, Any]) -> None:
+def _apply_weekly_mon_fri_alignment_fix(normalized: Dict[str, Any], ocr_text: str = "") -> None:
     """
     Fix weekly Sat..Fri templates where OCR/LLM can shift Monday-Friday hours into weekend columns.
     Trigger only for clear 7-day weekly windows with a Sat/Sun/Mon... header signature.
@@ -1503,6 +1539,11 @@ def _apply_weekly_mon_fri_alignment_fix(normalized: Dict[str, Any]) -> None:
     headers = [normalize_text(str(x)) for x in (normalized.get("headers") or []) if x is not None]
     table_cols = [str(x) for x in (normalized.get("table_columns") or []) if x is not None]
     if not headers or "total" not in " ".join(headers):
+        return
+    lowered_ocr = normalize_text(ocr_text or "")
+    # If explicit non-working rows are present (e.g., Unpaid Time Off), this
+    # normalization can incorrectly turn blank weekdays into 8. Skip in that case.
+    if any(tok in lowered_ocr for tok in ["unpaid", "time off", "pto", "leave", "holiday"]):
         return
     # Signature like: Sat Sun Mon Tue Wed Thu Fri TOTAL
     signature = ["sat", "sun", "mon", "tue", "wed", "thu", "fri"]
@@ -1936,7 +1977,7 @@ def postprocess_normalized(normalized: Dict[str, Any], ocr_text: str) -> Dict[st
     except Exception:
         pass
     try:
-        _apply_weekly_mon_fri_alignment_fix(normalized)
+        _apply_weekly_mon_fri_alignment_fix(normalized, ocr_text)
     except Exception:
         pass
     try:
@@ -2348,19 +2389,26 @@ def compare_data(step1: Dict[str, Any], extracted: Dict[str, Any], tolerance: fl
     return result
 
 
-def pattern_key(duration: str, day_hours: List[Dict[str, Any]]) -> str:
+def pattern_key(duration: str, day_hours: List[Dict[str, Any]], employee_name: str = "", vendor: str = "", company: str = "") -> str:
     pairs = []
     for item in sorted(day_hours, key=lambda x: x["date"]):
         d = datetime.strptime(item["date"], "%Y-%m-%d").strftime("%a")
         pairs.append(f"{d}:{float(item['hours']):.2f}")
-    return f"{duration}|{'|'.join(pairs)}"
+    who = normalize_text(employee_name)
+    ven = normalize_text(vendor)
+    comp = normalize_text(company)
+    return f"{duration}|emp:{who}|ven:{ven}|comp:{comp}|{'|'.join(pairs)}"
 
 
-def template_hash(extracted: Dict[str, Any]) -> str:
+def template_hash(extracted: Dict[str, Any], p_key: str = "") -> str:
+    # Use pattern_key as the primary bucketing key for trusted streak/learning memory.
+    # This guarantees stable template hash for the same effective pattern.
+    if p_key:
+        return hashlib.sha256(f"pk::{p_key}".encode("utf-8")).hexdigest()
+    # Fallback (defensive)
     raw = {
-        "headers": extracted.get("headers", []),
-        "columns": extracted.get("table_columns", []),
-        "row_count": len(extracted.get("day_hours", [])),
+        "headers": normalize_text(" ".join(str(x) for x in (extracted.get("headers") or []))),
+        "columns": normalize_text(" ".join(str(x) for x in (extracted.get("table_columns") or []))),
     }
     return hashlib.sha256(json.dumps(raw, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -2397,6 +2445,7 @@ def clear_all_history() -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.execute("delete from validation_history")
     conn.execute("delete from trusted_streaks")
+    conn.execute("delete from learning_approvals")
     # Reset AUTOINCREMENT sequence so next history record starts at 1
     conn.execute("delete from sqlite_sequence where name='validation_history'")
     conn.commit()
@@ -2405,6 +2454,11 @@ def clear_all_history() -> None:
 
 def decide(comparison: Dict[str, Any], confidence: float, streak: int) -> Tuple[str, str, List[str]]:
     reasons: List[str] = []
+
+    # Hard rule: date-wise hour mismatch must never auto-approve.
+    # Total-hours equality alone is not sufficient.
+    if comparison.get("mismatches", {}).get("day_hours"):
+        return "MANUAL_REVIEW", "MANUAL_REVIEW", ["Date-wise hours mismatch"]
 
     if not comparison["mismatches"] and comparison["critical_ok"]:
         return "AUTO_APPROVE", "AUTO_APPROVE", reasons
@@ -2422,6 +2476,92 @@ def decide(comparison: Dict[str, Any], confidence: float, streak: int) -> Tuple[
     for k in comparison["mismatches"].keys():
         reasons.append(f"Mismatch in {k}")
     return "MANUAL_REVIEW", "MANUAL_REVIEW", reasons
+
+
+def build_mismatch_signature(step1: Dict[str, Any], extracted: Dict[str, Any], comparison: Dict[str, Any]) -> str:
+    mismatches = comparison.get("mismatches", {}) if isinstance(comparison, dict) else {}
+    sig = {
+        "employee_name_mismatch": "employee_name" in mismatches,
+        "employee_name_blank": not normalize_text(str(extracted.get("employee_name", "") or "")),
+        "vendor_mismatch": "vendor" in mismatches,
+        "vendor_blank": not normalize_text(str(extracted.get("vendor", "") or "")),
+        "company_mismatch": "company" in mismatches,
+        "company_blank": not normalize_text(str(extracted.get("company", "") or "")),
+        "approval_mismatch": "approved" in mismatches,
+        "approval_missing": not normalize_text(str(extracted.get("approved", "") or "")),
+        "period_mismatch": ("period_start" in mismatches) or ("period_end" in mismatches),
+        "period_partial_in_range": bool(comparison.get("period_coverage_note")),
+        "total_hours_mismatch": "total_hours" in mismatches,
+        "day_hours_mismatch": "day_hours" in mismatches,
+        "step1_period_start": str(step1.get("period_start", "") or ""),
+        "step1_period_end": str(step1.get("period_end", "") or ""),
+    }
+    return hashlib.sha256(json.dumps(sig, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def get_learning_state(
+    employee_id: str,
+    vendor: str,
+    company: str,
+    t_hash: str,
+    p_key: str,
+    mismatch_signature: str,
+) -> Tuple[str, int]:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        """
+        select last_answer, streak_count
+        from learning_approvals
+        where employee_id=? and vendor=? and company=? and template_hash=? and pattern_key=? and mismatch_signature=?
+        """,
+        (employee_id, normalize_text(vendor), normalize_text(company), t_hash, p_key, mismatch_signature),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return "", 0
+    return str(row[0] or ""), int(row[1] or 0)
+
+
+def record_learning_answer(
+    employee_id: str,
+    vendor: str,
+    company: str,
+    t_hash: str,
+    p_key: str,
+    mismatch_signature: str,
+    answer: str,
+    question: str = "",
+) -> None:
+    prev_answer, prev_streak = get_learning_state(employee_id, vendor, company, t_hash, p_key, mismatch_signature)
+    answer_norm = normalize_text(answer)
+    new_streak = prev_streak + 1 if prev_answer == answer_norm else 1
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        insert into learning_approvals(employee_id,vendor,company,template_hash,pattern_key,mismatch_signature,last_answer,last_question,streak_count,updated_at)
+        values(?,?,?,?,?,?,?,?,?,?)
+        on conflict(employee_id,vendor,company,template_hash,pattern_key,mismatch_signature)
+        do update set
+            last_answer=excluded.last_answer,
+            last_question=excluded.last_question,
+            streak_count=excluded.streak_count,
+            updated_at=excluded.updated_at
+        """,
+        (
+            normalize_text(employee_id),
+            normalize_text(vendor),
+            normalize_text(company),
+            t_hash,
+            p_key,
+            mismatch_signature,
+            answer_norm,
+            str(question or ""),
+            new_streak,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 def build_reason_codes(
@@ -2472,6 +2612,7 @@ def build_reason_codes(
 
 def build_submission_hash(step1: Dict[str, Any], file_fingerprint: str) -> str:
     payload = {
+        "employee_id": normalize_text(step1.get("employee_id", "")),
         "employee_name": normalize_text(step1.get("employee_name", "")),
         "vendor": normalize_text(step1.get("vendor", "")),
         "company": normalize_text(step1.get("company", "")),
@@ -2561,6 +2702,7 @@ def load_manual_step1_prefill() -> Dict[str, Any]:
 
 def save_manual_step1_prefill(step1: Dict[str, Any]) -> None:
     payload = {
+        "employee_id": str(step1.get("employee_id", "") or ""),
         "employee_name": str(step1.get("employee_name", "") or ""),
         "vendor": str(step1.get("vendor", "") or ""),
         "company": str(step1.get("company", "") or ""),
@@ -2596,6 +2738,7 @@ def get_runtime_aws_config() -> Dict[str, str]:
 
 
 def log_history(
+    employee_id: str,
     employee_name: str,
     streak_value: int,
     template_hash_value: str,
@@ -2613,11 +2756,12 @@ def log_history(
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
-        insert into validation_history(created_at,employee_name,streak_value,template_hash,pattern_key,submission_hash,step1_json,extracted_json,comparison_json,decision,approval_type,reasons_json,reason_codes_json,aws_meta_json)
-        values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        insert into validation_history(created_at,employee_id,employee_name,streak_value,template_hash,pattern_key,submission_hash,step1_json,extracted_json,comparison_json,decision,approval_type,reasons_json,reason_codes_json,aws_meta_json)
+        values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             datetime.utcnow().isoformat(),
+            employee_id,
             employee_name,
             streak_value,
             template_hash_value,
@@ -2641,7 +2785,7 @@ def recent_history(limit: int = 20) -> List[Dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         """
-        select id, created_at, employee_name, streak_value, template_hash, pattern_key, decision, approval_type, reasons_json, reason_codes_json
+        select id, created_at, employee_id, employee_name, streak_value, template_hash, pattern_key, decision, approval_type, reasons_json, reason_codes_json
         from validation_history
         order by id desc
         limit ?
@@ -2653,19 +2797,50 @@ def recent_history(limit: int = 20) -> List[Dict[str, Any]]:
     for r in rows:
         reasons = []
         try:
-            reasons = json.loads(r[8]) if r[8] else []
+            reasons = json.loads(r[9]) if r[9] else []
         except json.JSONDecodeError:
-            reasons = [str(r[8])]
+            reasons = [str(r[9])]
         out.append(
             {
                 "record_id": r[0],
                 "created_at": r[1],
-                "employee_name": r[2] or "",
-                "streak": r[3] if r[3] is not None else 0,
-                "template_hash": (r[4] or "")[:12],
-                "pattern_key": (r[5] or "")[:40],
-                "decision": r[6],
+                "employee_id": r[2] or "",
+                "employee_name": r[3] or "",
+                "streak": r[4] if r[4] is not None else 0,
+                "template_hash": (r[5] or "")[:12],
+                "pattern_key": (r[6] or "")[:40],
+                "decision": r[7],
                 "reasons": "; ".join(reasons) if reasons else "",
+            }
+        )
+    return out
+
+
+def recent_learning_memory(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """
+        select employee_id, vendor, company, mismatch_signature, last_question, last_answer, streak_count, updated_at
+        from learning_approvals
+        order by updated_at desc
+        limit ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        sig = str(r[3] or "")
+        out.append(
+            {
+                "employee_id": r[0] or "",
+                "vendor": r[1] or "",
+                "company": r[2] or "",
+                "mismatch_signature": f"{sig[:14]}...{sig[-8:]}" if len(sig) > 26 else sig,
+                "question_short": r[4] or "",
+                "last_answer": r[5] or "",
+                "streak_count": r[6] if r[6] is not None else 0,
+                "updated_at": r[7] or "",
             }
         )
     return out
@@ -2932,6 +3107,7 @@ def prepare_next_document() -> None:
 
 def reset_step1_form_state() -> None:
     # Use pop/reset so this can be safely applied before widget creation.
+    st.session_state.pop("employee_id", None)
     st.session_state.pop("employee_name", None)
     st.session_state.pop("vendor", None)
     st.session_state.pop("company", None)
@@ -3085,6 +3261,8 @@ def main() -> None:
         st.session_state.pending_step1_reset = False
     if "employee_name" not in st.session_state:
         st.session_state.employee_name = ""
+    if "employee_id" not in st.session_state:
+        st.session_state.employee_id = ""
     if "vendor" not in st.session_state:
         st.session_state.vendor = ""
     if "company" not in st.session_state:
@@ -3102,6 +3280,8 @@ def main() -> None:
         st.session_state.pending_step1_reset = False
         if "employee_name" not in st.session_state:
             st.session_state.employee_name = ""
+        if "employee_id" not in st.session_state:
+            st.session_state.employee_id = ""
         if "vendor" not in st.session_state:
             st.session_state.vendor = ""
         if "company" not in st.session_state:
@@ -3130,6 +3310,7 @@ def main() -> None:
     if st.session_state.entry_mode == "Manual Entry" and not st.session_state.manual_prefill_loaded:
         cached = load_manual_step1_prefill()
         if cached:
+            st.session_state["employee_id"] = str(cached.get("employee_id", "") or "")
             st.session_state["employee_name"] = str(cached.get("employee_name", "") or "")
             st.session_state["vendor"] = str(cached.get("vendor", "") or "")
             st.session_state["company"] = str(cached.get("company", "") or "")
@@ -3157,6 +3338,7 @@ def main() -> None:
         if st.button("Clear Saved Step 1 Values"):
             clear_manual_step1_prefill()
             reset_step1_form_state()
+            st.session_state["employee_id"] = ""
             st.session_state["employee_name"] = ""
             st.session_state["vendor"] = ""
             st.session_state["company"] = ""
@@ -3185,6 +3367,7 @@ def main() -> None:
             if previous_source_fingerprint and previous_source_fingerprint != autofill_fingerprint:
                 reset_pipeline_state(clear_source=False)
                 st.session_state.autofill_extraction_preview = None
+                st.session_state["employee_id"] = ""
                 st.session_state["employee_name"] = ""
                 st.session_state["vendor"] = ""
                 st.session_state["company"] = ""
@@ -3232,6 +3415,7 @@ def main() -> None:
 
     c1, c2 = st.columns(2)
     with c1:
+        employee_id = st.text_input("Employee ID", key="employee_id")
         employee_name = st.text_input("Name", key="employee_name")
         vendor = st.text_input("Vendor", key="vendor")
         company = st.text_input("Company", key="company")
@@ -3323,10 +3507,14 @@ def main() -> None:
             selected_files = []
 
     if process_clicked and selected_files:
+        if not normalize_text(employee_id):
+            st.warning("Employee ID is required in Step 1.")
+            return
         fingerprint = hashlib.sha256(
             "||".join(sorted(x["fingerprint"] for x in selected_files)).encode("utf-8")
         ).hexdigest()
         step1 = {
+            "employee_id": employee_id,
             "employee_name": employee_name,
             "vendor": vendor,
             "company": company,
@@ -3776,8 +3964,8 @@ def main() -> None:
         progress.progress(70, text="Comparing with Step 1...")
         extracted = extraction["normalized"]
         comparison = compare_data(step1, extracted)
-        p_key = pattern_key(duration, day_hours)
-        t_hash = template_hash(extracted)
+        p_key = pattern_key(duration, day_hours, employee_name, vendor, company)
+        t_hash = template_hash(extracted, p_key)
         streak = get_streak(employee_name, vendor, company, t_hash, p_key)
         confidence = safe_float(extracted.get("confidence", 0.0), 0.0)
         decision, approval_type, reasons = decide(comparison, confidence, streak)
@@ -3795,13 +3983,37 @@ def main() -> None:
             decision = "MANUAL_REVIEW"
             approval_type = "MANUAL_REVIEW"
             reasons = reasons + forced_manual_reasons
+        mismatch_signature = build_mismatch_signature(step1, extracted, comparison)
+        learned_answer, learned_streak = get_learning_state(
+            employee_id,
+            vendor,
+            company,
+            t_hash,
+            p_key,
+            mismatch_signature,
+        )
+        if (
+            decision == "MANUAL_REVIEW"
+            and learned_answer == "yes"
+            and learned_streak >= APP_CONFIG["trusted_streak_threshold"]
+            and not comparison.get("mismatches", {}).get("day_hours")
+        ):
+            decision = "AUTO_APPROVE_TRUSTED"
+            approval_type = "AUTO_APPROVE_TRUSTED_TEMPLATE"
+            reasons = [f"Learned pattern auto-approve at threshold {APP_CONFIG['trusted_streak_threshold']}"]
         # Trusted pattern override (single/multi): after enough manual approvals
         # of same pattern, allow auto-approve for recurring non-critical/manual-only reasons.
         # Keep a hard stop for explicit negative approval statuses.
         trusted_trigger = max(APP_CONFIG["trusted_streak_threshold"] - 1, 0)
         approved_norm = normalize_text(str(extracted.get("approved", "") or ""))
         explicit_negative_approval = approved_norm in {"rejected", "declined", "pending"}
-        if streak >= trusted_trigger and not explicit_negative_approval:
+        has_daywise_mismatch = bool(comparison.get("mismatches", {}).get("day_hours"))
+        if (
+            streak >= trusted_trigger
+            and not explicit_negative_approval
+            and not has_daywise_mismatch
+            and not comparison.get("mismatches")
+        ):
             decision = "AUTO_APPROVE_TRUSTED"
             approval_type = "AUTO_APPROVE_TRUSTED_TEMPLATE"
             reasons = [f"Trusted auto-approve at threshold {APP_CONFIG['trusted_streak_threshold']}"]
@@ -3832,11 +4044,15 @@ def main() -> None:
             "processed_fingerprint": fingerprint,
             "per_file_status": per_file_status,
             "per_file_included_hours_total": round(per_file_included_hours_total, 2),
+            "mismatch_signature": mismatch_signature,
+            "learned_answer": learned_answer,
+            "learned_streak": learned_streak,
         }
         st.session_state.last_upload_fingerprint = fingerprint
         st.session_state.last_submission_hash = submission_hash
         if decision != "MANUAL_REVIEW":
             log_history(
+                employee_id,
                 employee_name,
                 display_streak,
                 t_hash,
@@ -3862,6 +4078,8 @@ def main() -> None:
         approval_type = result["approval_type"]
         reasons = result["reasons"]
         reason_codes = result.get("reason_codes", [])
+        mismatch_signature = result.get("mismatch_signature", "")
+        learned_streak = safe_float(result.get("learned_streak", 0), 0.0)
         streak = result["streak"]
         p_key = result["pattern_key"]
         t_hash = result["template_hash"]
@@ -3998,18 +4216,85 @@ def main() -> None:
 
         if decision == "MANUAL_REVIEW":
             st.subheader("Manual Review Action")
-            manual_outcome = st.selectbox("Outcome", ["APPROVE", "REJECT"], key="manual_outcome")
+            has_daywise_mismatch = bool(comparison.get("mismatches", {}).get("day_hours"))
+            learning_question_short = "manual_reject"
+            if has_daywise_mismatch:
+                st.warning("Date-wise hours mismatch detected. Only REJECT is allowed.")
+                manual_outcome = st.selectbox("Outcome", ["REJECT"], key="manual_outcome")
+                learning_answer = "no"
+                learning_question_short = "day_hours_mismatch"
+            else:
+                manual_outcome = st.selectbox("Outcome", ["APPROVE", "REJECT"], key="manual_outcome")
+                learning_answer = "yes"
+                if manual_outcome == "APPROVE":
+                    mismatch_keys = list((comparison.get("mismatches", {}) or {}).keys())
+                    question_map = {
+                        "employee_name": "Name does not match. Is this the same person?",
+                        "vendor": "Vendor does not match. Is this acceptable?",
+                        "company": "Company value is missing/mismatched. Is this acceptable for this employee/case?",
+                        "period_start": "Period start differs. Is this acceptable for this case?",
+                        "period_end": "Period end differs. Is this acceptable for this case?",
+                        "approved": "Approval signal is missing/mismatched. Is this acceptable?",
+                        "total_hours": "Total hours mismatch is present. Is this acceptable?",
+                    }
+                    per_mismatch_answers: List[str] = []
+                    asked_keys: List[str] = []
+                    for mk in mismatch_keys:
+                        q = question_map.get(mk, f"Mismatch in '{mk}'. Is this acceptable?")
+                        ans = st.radio(
+                            q,
+                            ["yes", "no"],
+                            horizontal=True,
+                            key=f"manual_learning_answer_{mk}",
+                        )
+                        asked_keys.append(mk)
+                        per_mismatch_answers.append(ans)
+                    if per_mismatch_answers:
+                        learning_answer = "yes" if all(x == "yes" for x in per_mismatch_answers) else "no"
+                        learning_question_short = f"mismatch:{','.join(sorted(set(asked_keys)))}"
+                    else:
+                        learning_answer = st.radio(
+                            "Is this mismatch pattern acceptable for this employee/case? (learned Yes/No)",
+                            ["yes", "no"],
+                            horizontal=True,
+                            key="manual_learning_answer",
+                        )
+                        learning_question_short = "general_mismatch"
+                    st.caption(f"Current learned streak for this pattern: {int(learned_streak)}")
             manual_comment = st.text_area("Comment", key="manual_comment")
             if st.button("Submit Manual Decision"):
                 if manual_outcome == "APPROVE":
                     new_streak = streak + 1
                     set_streak(employee_name, vendor, company, t_hash, p_key, new_streak)
+                    if mismatch_signature:
+                        record_learning_answer(
+                            employee_id,
+                            vendor,
+                            company,
+                            t_hash,
+                            p_key,
+                            mismatch_signature,
+                            learning_answer,
+                            learning_question_short,
+                        )
                     st.success(f"Manual approved; streak is now {new_streak}")
                 else:
                     new_streak = 0
                     set_streak(employee_name, vendor, company, t_hash, p_key, new_streak)
+                    if mismatch_signature:
+                        record_learning_answer(
+                            employee_id,
+                            vendor,
+                            company,
+                            t_hash,
+                            p_key,
+                            mismatch_signature,
+                            "no",
+                            learning_question_short,
+                        )
                     st.warning("Streak reset to 0")
                 log_history(
+                    employee_id,
                     employee_name,
                     new_streak,
                     t_hash,
@@ -4033,6 +4318,8 @@ def main() -> None:
         st.success("Validation and streak history cleared.")
         st.rerun()
     st.dataframe(recent_history(25), use_container_width=True)
+    st.subheader("Learning Pattern Memory")
+    st.dataframe(recent_learning_memory(50), use_container_width=True)
 
     st.caption("No file is saved to uploads folder. Extraction runs directly from in-memory upload bytes.")
 
