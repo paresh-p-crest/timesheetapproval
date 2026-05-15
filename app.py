@@ -28,11 +28,26 @@ APP_CONFIG = {
     "confidence_threshold": 0.8,
     "trusted_streak_threshold": 3,
     "critical_fields": ["employee_name", "vendor", "company"],
+    # Used only for pre-call cost preview (output size is unknown until the model responds).
+    "llm_assumed_output_tokens": 1200,
 }
 # Bump this when extraction/autofill mapping logic changes so cached autofill is recalculated.
 AUTOFILL_LOGIC_VERSION = "2026-04-17-v3"
 FIXED_AWS_REGION = "us-east-1"
 FIXED_BEDROCK_MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
+
+LLM_PREVIEW_DEFAULT_FOOTNOTE = (
+    "Out column shows assumed output tokens from Settings (Assumed output tokens). "
+    "For multiple files, the Total row sums input tokens, assumed output tokens, and estimated charge for rows that extracted successfully."
+)
+
+# Static column headers for the Step 2 usage table (not configurable in Settings).
+LLM_PREVIEW_TABLE_LABELS = {
+    "col_in": "In (tokens)",
+    "col_out": "Out (est. tokens)",
+    "col_rate": "Rate/M (in|out)",
+    "col_total": "Total (charge)",
+}
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -634,29 +649,13 @@ def build_confidence_breakdown(textract_raw: Dict[str, Any], normalized: Dict[st
     }
 
 
-def normalize_with_bedrock(text: str, hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    cfg = get_runtime_aws_config()
-    model_id = cfg["bedrock_model_id"]
-    if not model_id:
-        raise ValueError("BEDROCK_MODEL_ID missing. Set it in .env")
-    client_kwargs: Dict[str, Any] = {"region_name": cfg["aws_region"]}
-    if cfg.get("aws_access_key_id") and cfg.get("aws_secret_access_key"):
-        client_kwargs["aws_access_key_id"] = cfg["aws_access_key_id"]
-        client_kwargs["aws_secret_access_key"] = cfg["aws_secret_access_key"]
-        if cfg.get("aws_session_token"):
-            client_kwargs["aws_session_token"] = cfg["aws_session_token"]
-    bedrock_runtime_client = boto3.client("bedrock-runtime", **client_kwargs)
-    llm = ChatBedrock(
-        model_id=model_id,
-        region_name=cfg["aws_region"],
-        client=bedrock_runtime_client,
-        model_kwargs={"temperature": 0},
-    )
+def build_bedrock_normalization_prompt(text: str, hints: Dict[str, Any] | None = None) -> str:
+    """Full user prompt sent to Bedrock for timesheet JSON normalization (must stay in sync with normalize_with_bedrock)."""
     hints = hints or {}
     hint_duration = hints.get("duration", "")
     hint_period_start = hints.get("period_start", "")
     hint_period_end = hints.get("period_end", "")
-    prompt = f"""
+    return f"""
 Extract timesheet fields and return JSON only.
 Keys: employee_name, vendor, company, duration, period_start, period_end, approved, approver_name, day_hours, total_hours, confidence, headers, table_columns.
 day_hours must be [{"{"}"date":"YYYY-MM-DD","hours":number{"}"}].
@@ -674,7 +673,205 @@ Use empty string/array for unknown values.
 Text:
 {text}
 """
-    out = llm.invoke(prompt).content
+
+
+def count_prompt_tokens_estimate(prompt: str) -> int:
+    """Approximate tokenizer count (Claude-style text; not an official Anthropic meter)."""
+    raw = prompt or ""
+    try:
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        return max(1, len(enc.encode(raw)))
+    except Exception:
+        return max(1, len(raw.encode("utf-8")) // 4)
+
+
+def bedrock_claude_price_per_million_usd(model_id: str) -> Tuple[float, float, str]:
+    """
+    On-demand USD per 1M tokens (input, output) for common Bedrock Anthropic IDs.
+    Match longer/more specific substrings first. Unknown models use Sonnet-like defaults.
+    """
+    mid = (model_id or "").lower()
+    ordered: List[Tuple[str, float, float]] = [
+        ("anthropic.claude-3-opus", 15.0, 75.0),
+        ("claude-3-opus", 15.0, 75.0),
+        ("anthropic.claude-3-5-sonnet", 3.0, 15.0),
+        ("claude-3-5-sonnet", 3.0, 15.0),
+        ("anthropic.claude-3-sonnet", 3.0, 15.0),
+        ("claude-3-sonnet", 3.0, 15.0),
+        ("anthropic.claude-3-haiku", 0.25, 1.25),
+        ("claude-3-haiku", 0.25, 1.25),
+        ("anthropic.claude-sonnet-4", 3.0, 15.0),
+        ("anthropic.claude-3-7-sonnet", 3.0, 15.0),
+    ]
+    for needle, inp_m, out_m in ordered:
+        if needle in mid:
+            return inp_m, out_m, needle
+    return 3.0, 15.0, "default_pricing_profile"
+
+
+def resolve_llm_unit_pricing(model_id: str) -> Tuple[float, float, str, str]:
+    """
+    Returns (input_per_million_tokens, output_per_million_tokens, profile_label, charge_unit).
+    charge_unit is \"USD\" (public table or custom dollars per 1M) or \"credits\" (custom internal credits per 1M).
+    """
+    mode = normalize_text(get_setting_text("llm_pricing_mode", "auto")).lower() or "auto"
+    if mode in {"custom_usd", "custom", "usd"}:
+        inp = get_setting_float("llm_custom_input_usd_per_mtok", 3.0)
+        out = get_setting_float("llm_custom_output_usd_per_mtok", 15.0)
+        return max(0.0, inp), max(0.0, out), "custom_usd_per_mtok", "USD"
+    if mode in {"custom_credits", "credits", "credit"}:
+        inp = get_setting_float("llm_custom_input_credits_per_mtok", 100.0)
+        out = get_setting_float("llm_custom_output_credits_per_mtok", 500.0)
+        return max(0.0, inp), max(0.0, out), "custom_credits_per_mtok", "credits"
+    in_per_m, out_per_m, profile = bedrock_claude_price_per_million_usd(model_id)
+    return in_per_m, out_per_m, profile, "USD"
+
+
+def estimate_bedrock_llm_cost(
+    model_id: str, prompt: str, assumed_output_tokens: int | None = None
+) -> Dict[str, Any]:
+    assumed_out = int(assumed_output_tokens if assumed_output_tokens is not None else APP_CONFIG["llm_assumed_output_tokens"])
+    assumed_out = max(0, assumed_out)
+    input_tok = count_prompt_tokens_estimate(prompt)
+    in_per_m, out_per_m, profile, unit = resolve_llm_unit_pricing(model_id)
+    in_cost = input_tok * in_per_m / 1_000_000.0
+    out_cost = assumed_out * out_per_m / 1_000_000.0
+    total_c = in_cost + out_cost
+    note_auto = (
+        "Approximate charges using the built-in On-Demand style table for the selected model ID family; "
+        "tokens are estimated (tiktoken / byte fallback), not provider meters."
+    )
+    note_custom_usd = "Charges use your custom USD amounts per 1 million input/output tokens from Settings."
+    note_custom_cr = "Charges use your custom internal credits per 1 million input/output tokens from Settings."
+    if profile == "custom_usd_per_mtok":
+        note = note_custom_usd
+    elif profile == "custom_credits_per_mtok":
+        note = note_custom_cr
+    else:
+        note = note_auto
+    out: Dict[str, Any] = {
+        "model_id": model_id,
+        "pricing_profile": profile,
+        "pricing_mode_resolved": get_setting_text("llm_pricing_mode", "auto").strip() or "auto",
+        "charge_unit": unit,
+        "input_tokens_est": input_tok,
+        "output_tokens_assumed": assumed_out,
+        "input_rate_per_mtok": in_per_m,
+        "output_rate_per_mtok": out_per_m,
+        "input_charge_est": round(in_cost, 6),
+        "output_charge_est": round(out_cost, 6),
+        "total_charge_est": round(total_c, 6),
+        "input_usd_est": round(in_cost, 6) if unit == "USD" else 0.0,
+        "output_usd_est": round(out_cost, 6) if unit == "USD" else 0.0,
+        "total_usd_est": round(total_c, 6) if unit == "USD" else 0.0,
+        "usd_per_mtok_input": in_per_m if unit == "USD" else None,
+        "usd_per_mtok_output": out_per_m if unit == "USD" else None,
+        "input_credits_est": round(in_cost, 6) if unit == "credits" else None,
+        "output_credits_est": round(out_cost, 6) if unit == "credits" else None,
+        "total_credits_est": round(total_c, 6) if unit == "credits" else None,
+        "credits_per_mtok_input": in_per_m if unit == "credits" else None,
+        "credits_per_mtok_output": out_per_m if unit == "credits" else None,
+        "pricing_note": note,
+    }
+    return out
+
+
+def _streamlit_script_active() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+def _merge_usage_from_llm_response(cost_preview: Dict[str, Any], response_metadata: Any) -> None:
+    if not isinstance(cost_preview, dict) or not isinstance(response_metadata, dict):
+        return
+    usage = response_metadata.get("usage")
+    if not isinstance(usage, dict):
+        usage = response_metadata
+    inp = usage.get("input_tokens")
+    if inp is None:
+        inp = usage.get("prompt_tokens")
+    out = usage.get("output_tokens")
+    if out is None:
+        out = usage.get("completion_tokens")
+    if inp is None and isinstance(response_metadata.get("input_tokens"), int):
+        inp = response_metadata.get("input_tokens")
+    if out is None and isinstance(response_metadata.get("output_tokens"), int):
+        out = response_metadata.get("output_tokens")
+    if inp is not None:
+        try:
+            cost_preview["actual_input_tokens"] = int(inp)
+        except (TypeError, ValueError):
+            pass
+    if out is not None:
+        try:
+            cost_preview["actual_output_tokens"] = int(out)
+        except (TypeError, ValueError):
+            pass
+    model_id = str(cost_preview.get("model_id", "") or "")
+    in_per_m, out_per_m, _, unit = resolve_llm_unit_pricing(model_id)
+    ai = cost_preview.get("actual_input_tokens")
+    ao = cost_preview.get("actual_output_tokens")
+    if isinstance(ai, int) and isinstance(ao, int):
+        total_actual = ai * in_per_m / 1_000_000.0 + ao * out_per_m / 1_000_000.0
+        cost_preview["actual_total_charge_est"] = round(total_actual, 6)
+        if unit == "USD":
+            cost_preview["actual_total_usd_est"] = round(total_actual, 6)
+        else:
+            cost_preview["actual_total_credits_est"] = round(total_actual, 6)
+
+
+def normalize_with_bedrock(
+    text: str,
+    hints: Dict[str, Any] | None = None,
+    *,
+    source_label: str = "",
+    cost_preview_holder: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    cfg = get_runtime_aws_config()
+    model_id = cfg["bedrock_model_id"]
+    if not model_id:
+        raise ValueError("BEDROCK_MODEL_ID missing. Set it in .env")
+    client_kwargs: Dict[str, Any] = {"region_name": cfg["aws_region"]}
+    if cfg.get("aws_access_key_id") and cfg.get("aws_secret_access_key"):
+        client_kwargs["aws_access_key_id"] = cfg["aws_access_key_id"]
+        client_kwargs["aws_secret_access_key"] = cfg["aws_secret_access_key"]
+        if cfg.get("aws_session_token"):
+            client_kwargs["aws_session_token"] = cfg["aws_session_token"]
+    bedrock_runtime_client = boto3.client("bedrock-runtime", **client_kwargs)
+    llm = ChatBedrock(
+        model_id=model_id,
+        region_name=cfg["aws_region"],
+        client=bedrock_runtime_client,
+        model_kwargs={"temperature": 0},
+    )
+    prompt = build_bedrock_normalization_prompt(text, hints)
+    preview = estimate_bedrock_llm_cost(model_id, prompt)
+    if cost_preview_holder is not None:
+        cost_preview_holder.clear()
+        cost_preview_holder.update(preview)
+    if _streamlit_script_active():
+        tag = f" ({source_label})" if source_label else ""
+        unit = preview.get("charge_unit", "USD")
+        total = preview.get("total_charge_est", preview.get("total_usd_est", 0.0))
+        unit_label = "USD" if unit == "USD" else "credits"
+        st.info(
+            f"Before LLM call{tag}: model `{preview['model_id']}` · "
+            f"~{preview['input_tokens_est']:,} input tokens · "
+            f"assuming {preview['output_tokens_assumed']:,} output tokens · "
+            f"estimated **{unit_label} {total:.4f}** total ({preview['pricing_profile']} · "
+            f"{preview['input_rate_per_mtok']:.4g}/{preview['output_rate_per_mtok']:.4g} per 1M {unit_label} in/out). "
+            f"Actual usage and provider charges may differ."
+        )
+    msg = llm.invoke(prompt)
+    if cost_preview_holder is not None:
+        _merge_usage_from_llm_response(cost_preview_holder, getattr(msg, "response_metadata", None) or {})
+    out = msg.content
     if isinstance(out, list):
         out = "".join(str(x) for x in out)
     return extract_json_from_text(str(out))
@@ -2011,6 +2208,244 @@ def postprocess_normalized(normalized: Dict[str, Any], ocr_text: str) -> Dict[st
     return normalized
 
 
+def extract_document_text_only(file_bytes: bytes, filename: str) -> Dict[str, Any]:
+    """
+    OCR / local text extraction only (Textract or fallbacks). No Bedrock.
+
+    Returns on success:
+      {"ok": True, "text": str, "raw": Any, "textract_used": bool,
+       "prevalidation": dict, "quality_validation": dict}
+    Returns on failure (same semantics as early return from extract_and_normalize):
+      {"ok": False, "normalized": dict, "raw": dict, "prevalidation": dict, "quality_validation": dict}
+    """
+    precheck = prevalidate_file(file_bytes, filename)
+    quality = validate_image_quality(file_bytes, filename)
+    ext = os.path.splitext((filename or "").lower())[1]
+    if precheck.get("failed"):
+        return {
+            "ok": False,
+            "normalized": default_normalized("Pre-validation failed"),
+            "raw": {"error": "; ".join(precheck.get("issues", []))},
+            "prevalidation": precheck,
+            "quality_validation": quality,
+        }
+    try:
+        if ext in {".pdf", ".png", ".jpg", ".jpeg"}:
+            textract_out = textract_extract(file_bytes, filename)
+            textract_used = True
+        elif ext == ".txt":
+            textract_out = {
+                "raw": {"fallback": "txt_text_extract"},
+                "text": extract_text_from_txt_local(file_bytes),
+                "filename": filename,
+            }
+            textract_used = False
+        elif ext == ".docx":
+            textract_out = {
+                "raw": {"fallback": "docx_text_extract"},
+                "text": extract_text_from_docx_local(file_bytes),
+                "filename": filename,
+            }
+            textract_used = False
+        elif ext == ".doc":
+            textract_out = {
+                "raw": {"fallback": "doc_text_extract"},
+                "text": extract_text_from_doc_local(file_bytes),
+                "filename": filename,
+            }
+            textract_used = False
+        else:
+            return {
+                "ok": False,
+                "normalized": default_normalized(f"unsupported_extension: {ext}"),
+                "raw": {"error": f"Unsupported extension: {ext}"},
+                "prevalidation": precheck,
+                "quality_validation": quality,
+            }
+    except Exception as exc:
+        err = str(exc)
+        if ext == ".pdf" and ("UnsupportedDocumentException" in err or "InvalidParameterException" in err):
+            try:
+                fallback_text = extract_text_from_pdf_local(file_bytes)
+                if fallback_text.strip():
+                    textract_out = {"raw": {"fallback": "pypdf_text_extract"}, "text": fallback_text, "filename": filename}
+                    textract_used = False
+                else:
+                    return {
+                        "ok": False,
+                        "normalized": default_normalized(f"textract_failed: {exc}"),
+                        "raw": {"error": str(exc)},
+                        "prevalidation": precheck,
+                        "quality_validation": quality,
+                    }
+            except Exception as pdf_exc:
+                return {
+                    "ok": False,
+                    "normalized": default_normalized(f"textract_failed: {exc}; pdf_fallback_failed: {pdf_exc}"),
+                    "raw": {"error": str(exc)},
+                    "prevalidation": precheck,
+                    "quality_validation": quality,
+                }
+        return {
+            "ok": False,
+            "normalized": default_normalized(f"textract_failed: {exc}"),
+            "raw": {"error": str(exc)},
+            "prevalidation": precheck,
+            "quality_validation": quality,
+        }
+
+    text = (textract_out.get("text", "") or "").strip()
+    if not text:
+        return {
+            "ok": False,
+            "normalized": default_normalized("No readable text found in document"),
+            "raw": {"error": "No readable text found in document"},
+            "prevalidation": precheck,
+            "quality_validation": quality,
+        }
+    return {
+        "ok": True,
+        "text": text,
+        "raw": textract_out.get("raw"),
+        "textract_used": textract_used,
+        "prevalidation": precheck,
+        "quality_validation": quality,
+    }
+
+
+def llm_cost_preview_from_extracted_text(text: str, hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Token + USD estimate for the Bedrock normalization prompt (no API calls)."""
+    cfg = get_runtime_aws_config()
+    model_id = (cfg.get("bedrock_model_id") or "").strip()
+    prompt = build_bedrock_normalization_prompt(text, hints)
+    return estimate_bedrock_llm_cost(model_id, prompt)
+
+
+def ellipsize_middle(text: str, max_len: int = 34) -> str:
+    """Shorten long strings (e.g. filenames) for compact tables."""
+    s = (text or "").strip() or "—"
+    if len(s) <= max_len:
+        return s
+    left = max(8, max_len // 2 - 1)
+    right = max_len - left - 1
+    return s[:left] + "…" + s[-right:] if right > 0 else s[: max_len - 1] + "…"
+
+
+def short_bedrock_model_label(model_id: str) -> str:
+    """Friendly label for Bedrock model IDs (demo-friendly)."""
+    mid = (model_id or "").lower()
+    ordered = [
+        ("claude-3-opus", "Claude 3 Opus"),
+        ("claude-3-5-sonnet", "Claude 3.5 Sonnet"),
+        ("claude-3-sonnet", "Claude 3 Sonnet"),
+        ("claude-3-haiku", "Claude 3 Haiku"),
+        ("claude-sonnet-4", "Claude Sonnet 4"),
+        ("claude-3-7-sonnet", "Claude 3.7 Sonnet"),
+    ]
+    for needle, label in ordered:
+        if needle in mid:
+            return label
+    raw = (model_id or "").strip()
+    if not raw:
+        return "—"
+    tail = raw.split("/")[-1]
+    if len(tail) > 26:
+        return ellipsize_middle(tail, 26)
+    return tail
+
+
+def _llm_preview_pricing_fingerprint() -> str:
+    cfg = get_runtime_aws_config()
+    parts = [
+        cfg.get("bedrock_model_id", "") or "",
+        get_setting_text("llm_pricing_mode", "auto"),
+        str(get_setting_float("llm_custom_input_usd_per_mtok", 0.0)),
+        str(get_setting_float("llm_custom_output_usd_per_mtok", 0.0)),
+        str(get_setting_float("llm_custom_input_credits_per_mtok", 0.0)),
+        str(get_setting_float("llm_custom_output_credits_per_mtok", 0.0)),
+        str(APP_CONFIG.get("llm_assumed_output_tokens", 1200)),
+    ]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def build_compact_llm_preview_rows(
+    preview_targets: List[Dict[str, Any]],
+    hints_preview: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """One compact row per file for Step 2 auto-preview (Textract/OCR only); optional total row for multi-file."""
+    c_in = LLM_PREVIEW_TABLE_LABELS["col_in"]
+    c_out = LLM_PREVIEW_TABLE_LABELS["col_out"]
+    c_rate = LLM_PREVIEW_TABLE_LABELS["col_rate"]
+    c_tot = LLM_PREVIEW_TABLE_LABELS["col_total"]
+    rows: List[Dict[str, Any]] = []
+    sum_in = 0
+    sum_out = 0
+    sum_charge = 0.0
+    unit_seen: str | None = None
+    n_ok = 0
+
+    for idx, fo in enumerate(preview_targets):
+        fn = str(fo.get("name") or f"file_{idx + 1}").strip() or f"file_{idx + 1}"
+        tex = extract_document_text_only(fo["bytes"], fn)
+        if not tex.get("ok"):
+            err = (tex.get("raw") or {}).get("error") or str((tex.get("normalized") or {}).get("error", "Failed"))
+            rows.append(
+                {
+                    "File": ellipsize_middle(fn, 32),
+                    "Model": "—",
+                    c_in: None,
+                    c_out: None,
+                    c_rate: "—",
+                    c_tot: ellipsize_middle(f"Issue: {err}", 44),
+                }
+            )
+            continue
+        prev = llm_cost_preview_from_extracted_text(tex["text"], hints=hints_preview)
+        u = str(prev.get("charge_unit", "USD") or "USD")
+        unit_seen = u
+        rin = prev.get("input_rate_per_mtok")
+        rout = prev.get("output_rate_per_mtok")
+        try:
+            rate_s = f"{float(rin):g}/{float(rout):g}" if rin is not None and rout is not None else "—"
+        except (TypeError, ValueError):
+            rate_s = f"{rin}/{rout}"
+        total = prev.get("total_charge_est")
+        try:
+            tot_s = f"{float(total):.4f} {u}" if total is not None else "—"
+            sum_charge += float(total) if total is not None else 0.0
+        except (TypeError, ValueError):
+            tot_s = str(total)
+        it = int(prev.get("input_tokens_est") or 0)
+        ot = int(prev.get("output_tokens_assumed") or 0)
+        sum_in += it
+        sum_out += ot
+        n_ok += 1
+        rows.append(
+            {
+                "File": ellipsize_middle(fn, 32),
+                "Model": short_bedrock_model_label(str(prev.get("model_id", "") or "")),
+                c_in: it,
+                c_out: ot,
+                c_rate: rate_s,
+                c_tot: tot_s,
+            }
+        )
+
+    if len(preview_targets) > 1 and n_ok > 0:
+        u = unit_seen or "USD"
+        rows.append(
+            {
+                "File": ellipsize_middle(f"Total ({len(preview_targets)} files, {n_ok} ok)", 36),
+                "Model": "—",
+                c_in: sum_in,
+                c_out: sum_out,
+                c_rate: "—",
+                c_tot: f"{sum_charge:.4f} {u}",
+            }
+        )
+    return rows
+
+
 def extract_and_normalize(file_bytes: bytes, filename: str, hints: Dict[str, Any] | None = None) -> Dict[str, Any]:
     runtime_cfg = get_runtime_aws_config()
     meta = {
@@ -2021,68 +2456,37 @@ def extract_and_normalize(file_bytes: bytes, filename: str, hints: Dict[str, Any
         "prevalidation": {},
         "quality_validation": {},
     }
-    precheck = prevalidate_file(file_bytes, filename)
-    meta["prevalidation"] = precheck
-    if precheck.get("failed"):
+    text_only = extract_document_text_only(file_bytes, filename)
+    meta["prevalidation"] = text_only.get("prevalidation", {})
+    meta["quality_validation"] = text_only.get("quality_validation", {})
+    if not text_only.get("ok"):
         return {
-            "normalized": default_normalized("Pre-validation failed"),
-            "raw": {"error": "; ".join(precheck.get("issues", []))},
+            "normalized": text_only["normalized"],
+            "raw": text_only["raw"],
             "meta": meta,
         }
-
-    quality = validate_image_quality(file_bytes, filename)
-    meta["quality_validation"] = quality
-    ext = os.path.splitext((filename or "").lower())[1]
-    try:
-        if ext in {".pdf", ".png", ".jpg", ".jpeg"}:
-            textract_out = textract_extract(file_bytes, filename)
-            meta["textract_used"] = True
-        elif ext == ".txt":
-            textract_out = {"raw": {"fallback": "txt_text_extract"}, "text": extract_text_from_txt_local(file_bytes), "filename": filename}
-            meta["textract_used"] = False
-        elif ext == ".docx":
-            textract_out = {"raw": {"fallback": "docx_text_extract"}, "text": extract_text_from_docx_local(file_bytes), "filename": filename}
-            meta["textract_used"] = False
-        elif ext == ".doc":
-            textract_out = {"raw": {"fallback": "doc_text_extract"}, "text": extract_text_from_doc_local(file_bytes), "filename": filename}
-            meta["textract_used"] = False
-        else:
-            return {"normalized": default_normalized(f"unsupported_extension: {ext}"), "raw": {"error": f"Unsupported extension: {ext}"}, "meta": meta}
-    except Exception as exc:
-        err = str(exc)
-        # Some PDFs are rejected by AnalyzeDocument depending on internal format.
-        # Fallback to local PDF text extraction so Bedrock can still normalize fields.
-        if ext == ".pdf" and ("UnsupportedDocumentException" in err or "InvalidParameterException" in err):
-            try:
-                fallback_text = extract_text_from_pdf_local(file_bytes)
-                if fallback_text.strip():
-                    textract_out = {"raw": {"fallback": "pypdf_text_extract"}, "text": fallback_text, "filename": filename}
-                    meta["textract_used"] = False
-                else:
-                    return {"normalized": default_normalized(f"textract_failed: {exc}"), "raw": {"error": str(exc)}, "meta": meta}
-            except Exception as pdf_exc:
-                return {
-                    "normalized": default_normalized(f"textract_failed: {exc}; pdf_fallback_failed: {pdf_exc}"),
-                    "raw": {"error": str(exc)},
-                    "meta": meta,
-                }
-        else:
-            return {"normalized": default_normalized(f"textract_failed: {exc}"), "raw": {"error": str(exc)}, "meta": meta}
-
-    if not (textract_out.get("text", "") or "").strip():
-        return {
-            "normalized": default_normalized("No readable text found in document"),
-            "raw": {"error": "No readable text found in document"},
-            "meta": meta,
-        }
+    meta["textract_used"] = bool(text_only.get("textract_used"))
+    textract_out = {
+        "text": text_only["text"],
+        "raw": text_only.get("raw"),
+        "filename": filename,
+    }
 
     bedrock_failed = False
+    llm_cost_preview: Dict[str, Any] = {}
     try:
-        normalized = normalize_with_bedrock(textract_out["text"], hints=hints)
+        normalized = normalize_with_bedrock(
+            textract_out["text"],
+            hints=hints,
+            source_label=filename or "",
+            cost_preview_holder=llm_cost_preview,
+        )
         meta["llm_used"] = True
     except Exception as exc:
         bedrock_failed = True
         normalized = default_normalized(f"bedrock_normalization_failed: {exc}")
+    if llm_cost_preview:
+        meta["llm_cost_preview"] = llm_cost_preview
 
     # Fallback: if Bedrock failed, we still try to get day-wise hours from Textract tables.
     if bedrock_failed and not normalized.get("day_hours"):
@@ -2661,6 +3065,29 @@ def save_setting_int(key: str, value: int) -> None:
     conn.close()
 
 
+def get_setting_float(key: str, default: float) -> float:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("select value from app_settings where key=?", (key,)).fetchone()
+    conn.close()
+    if not row:
+        return default
+    return safe_float(row[0], default)
+
+
+def save_setting_float(key: str, value: float) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        insert into app_settings(key, value)
+        values(?, ?)
+        on conflict(key) do update set value=excluded.value
+        """,
+        (key, str(float(value))),
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_setting_text(key: str, default: str = "") -> str:
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -3091,6 +3518,8 @@ def reset_pipeline_state(clear_source: bool = False) -> None:
     st.session_state.last_upload_fingerprint = None
     st.session_state.last_submission_hash = None
     if clear_source:
+        st.session_state["step2_llm_preview_cache_v2"] = ""
+        st.session_state["step2_llm_preview_rows_v2"] = []
         st.session_state.source_file_bytes = None
         st.session_state.source_file_name = ""
         st.session_state.source_file_fingerprint = None
@@ -3131,6 +3560,9 @@ def main() -> None:
     current_threshold = get_setting_int("trusted_streak_threshold", APP_CONFIG["trusted_streak_threshold"])
     current_threshold = max(1, min(6, current_threshold))
     APP_CONFIG["trusted_streak_threshold"] = current_threshold
+    assumed_out_tok = get_setting_int("llm_assumed_output_tokens", APP_CONFIG["llm_assumed_output_tokens"])
+    assumed_out_tok = max(0, min(32000, assumed_out_tok))
+    APP_CONFIG["llm_assumed_output_tokens"] = assumed_out_tok
 
     page = st.sidebar.selectbox("Navigation", ["Approval", "Settings"])
     if page == "Settings":
@@ -3217,6 +3649,93 @@ def main() -> None:
             if (aws_session_token_input or "").strip():
                 save_setting_text("aws_session_token", aws_session_token_input.strip())
             st.success("AWS configuration saved.")
+            st.rerun()
+
+        st.caption(
+            "LLM preview: output token count is unknown until the model responds, so an assumed value is used. "
+            "Pricing for estimates comes from **LLM cost estimate (pricing)** below (auto table or your custom rates)."
+        )
+        assumed_preview = st.number_input(
+            "Assumed output tokens (cost preview only)",
+            min_value=0,
+            max_value=32000,
+            value=int(APP_CONFIG.get("llm_assumed_output_tokens", 1200)),
+            step=50,
+            key="set_llm_assumed_output_tokens",
+            help="Higher values raise the estimated charge before each Bedrock call. Does not cap the model.",
+        )
+        if st.button("Save LLM preview setting"):
+            save_setting_int("llm_assumed_output_tokens", int(assumed_preview))
+            APP_CONFIG["llm_assumed_output_tokens"] = max(0, min(32000, int(assumed_preview)))
+            st.success("Assumed output tokens saved.")
+            st.rerun()
+
+        st.divider()
+        st.subheader("LLM cost estimate (pricing)")
+        st.caption(
+            "**Auto** uses a built-in USD table keyed off **Bedrock Model ID** (different models → different rates). "
+            "**Custom USD** / **Custom credits** ignore that table and use your numbers per **1 million** input and output tokens. "
+            "Per-token cost is rate ÷ 1,000,000 (e.g. USD 3 / 1M input → USD 0.000003 per input token)."
+        )
+        mode_options = ["auto", "custom_usd", "custom_credits"]
+        cur_mode = (get_setting_text("llm_pricing_mode", "auto").strip().lower() or "auto")
+        if cur_mode not in mode_options:
+            cur_mode = "auto"
+        mode_index = mode_options.index(cur_mode)
+        pricing_mode_sel = st.selectbox(
+            "Pricing basis for estimates",
+            options=mode_options,
+            index=mode_index,
+            format_func=lambda x: {
+                "auto": "Built-in USD table (by Bedrock model ID above)",
+                "custom_usd": "Custom USD per 1M input and 1M output tokens",
+                "custom_credits": "Custom internal credits per 1M input and 1M output tokens",
+            }[x],
+            key="llm_pricing_mode_select",
+        )
+        custom_usd_in = st.number_input(
+            "Custom USD per 1M input tokens",
+            min_value=0.0,
+            value=float(get_setting_float("llm_custom_input_usd_per_mtok", 3.0)),
+            step=0.01,
+            format="%.4f",
+            key="llm_custom_in_usd",
+            disabled=(pricing_mode_sel != "custom_usd"),
+        )
+        custom_usd_out = st.number_input(
+            "Custom USD per 1M output tokens",
+            min_value=0.0,
+            value=float(get_setting_float("llm_custom_output_usd_per_mtok", 15.0)),
+            step=0.01,
+            format="%.4f",
+            key="llm_custom_out_usd",
+            disabled=(pricing_mode_sel != "custom_usd"),
+        )
+        custom_cr_in = st.number_input(
+            "Custom credits per 1M input tokens",
+            min_value=0.0,
+            value=float(get_setting_float("llm_custom_input_credits_per_mtok", 100.0)),
+            step=1.0,
+            format="%.2f",
+            key="llm_custom_in_credits",
+            disabled=(pricing_mode_sel != "custom_credits"),
+        )
+        custom_cr_out = st.number_input(
+            "Custom credits per 1M output tokens",
+            min_value=0.0,
+            value=float(get_setting_float("llm_custom_output_credits_per_mtok", 500.0)),
+            step=1.0,
+            format="%.2f",
+            key="llm_custom_out_credits",
+            disabled=(pricing_mode_sel != "custom_credits"),
+        )
+        if st.button("Save LLM pricing"):
+            save_setting_text("llm_pricing_mode", pricing_mode_sel.strip())
+            save_setting_float("llm_custom_input_usd_per_mtok", float(custom_usd_in))
+            save_setting_float("llm_custom_output_usd_per_mtok", float(custom_usd_out))
+            save_setting_float("llm_custom_input_credits_per_mtok", float(custom_cr_in))
+            save_setting_float("llm_custom_output_credits_per_mtok", float(custom_cr_out))
+            st.success("LLM pricing settings saved.")
             st.rerun()
 
         if st.button("Clear Saved AWS Credentials"):
@@ -3472,6 +3991,13 @@ def main() -> None:
                 st.code(ocr_preview[:1200])
 
     st.subheader("Step 2 - Validate and Decide")
+    st.caption(
+        "Estimated usage updates automatically when files or the period above change (text is extracted first). "
+        "Use **Process Next** below the estimate to run the full validation and model step."
+    )
+    process_clicked = False
+    selected_files: List[Dict[str, Any]] = []
+    manual_files = None
     if st.session_state.entry_mode == "Manual Entry":
         st.caption("Upload one or more timesheet files and process together.")
         manual_files = st.file_uploader(
@@ -3480,6 +4006,70 @@ def main() -> None:
             accept_multiple_files=True,
             key=f"uploader_{st.session_state.uploader_key}",
         )
+    else:
+        st.caption("Process the file already uploaded in Step 1.")
+
+    step1_ps_text_pv = period_start.isoformat() if isinstance(period_start, date) else ""
+    step1_pe_text_pv = period_end.isoformat() if isinstance(period_end, date) else ""
+    hints_preview: Dict[str, Any] = {
+        "duration": duration,
+        "period_start": step1_ps_text_pv,
+        "period_end": step1_pe_text_pv,
+    }
+    preview_targets: List[Dict[str, Any]] = []
+    if st.session_state.entry_mode == "Manual Entry":
+        if manual_files:
+            for idx, f in enumerate(manual_files):
+                preview_targets.append({"name": f.name or f"file_{idx + 1}", "bytes": f.getvalue()})
+    elif st.session_state.source_file_bytes is not None:
+        preview_targets.append(
+            {
+                "name": st.session_state.source_file_name or "source_upload",
+                "bytes": st.session_state.source_file_bytes,
+            }
+        )
+
+    CACHE_K = "step2_llm_preview_cache_v2"
+    ROWS_K = "step2_llm_preview_rows_v2"
+    if not preview_targets:
+        st.session_state[CACHE_K] = ""
+        st.session_state[ROWS_K] = []
+    else:
+        fps = [hashlib.sha256(x["bytes"]).hexdigest() + "::" + str(x.get("name", "")) for x in preview_targets]
+        cache_payload = {
+            "entry": st.session_state.entry_mode,
+            "fps": sorted(fps),
+            "hints": hints_preview,
+            "pf": _llm_preview_pricing_fingerprint(),
+        }
+        cache_key = hashlib.sha256(json.dumps(cache_payload, sort_keys=True).encode("utf-8")).hexdigest()
+        if st.session_state.get(CACHE_K) != cache_key:
+            with st.spinner("Updating estimate from uploaded document(s)…"):
+                st.session_state[ROWS_K] = build_compact_llm_preview_rows(preview_targets, hints_preview)
+            st.session_state[CACHE_K] = cache_key
+
+    rows_display = st.session_state.get(ROWS_K) or []
+    if rows_display:
+        st.markdown("**Estimated LLM usage** (tokens & charge)")
+        st.caption(LLM_PREVIEW_DEFAULT_FOOTNOTE)
+        df_pv = pd.DataFrame(rows_display)
+        try:
+            ct = LLM_PREVIEW_TABLE_LABELS["col_total"]
+            cc: Dict[str, Any] = {
+                "File": st.column_config.TextColumn("File", width="small"),
+                "Model": st.column_config.TextColumn("Model", width="small"),
+                ct: st.column_config.TextColumn(ct, width="small"),
+            }
+            st.dataframe(
+                df_pv,
+                use_container_width=True,
+                hide_index=True,
+                column_config=cc,
+            )
+        except Exception:
+            st.dataframe(df_pv, use_container_width=True, hide_index=True)
+
+    if st.session_state.entry_mode == "Manual Entry":
         process_clicked = st.button("Process Next", type="primary")
         if process_clicked:
             if not manual_files:
@@ -3490,10 +4080,7 @@ def main() -> None:
                 b = f.getvalue()
                 fp = hashlib.sha256(b).hexdigest()
                 selected_files.append({"name": f.name, "bytes": b, "fingerprint": fp})
-        else:
-            selected_files = []
     else:
-        st.caption("Process the file already uploaded in Step 1.")
         process_clicked = st.button("Process Next", type="primary")
         if process_clicked:
             if st.session_state.source_file_bytes is None:
@@ -3503,8 +4090,6 @@ def main() -> None:
             file_name = st.session_state.source_file_name or "source_upload"
             fingerprint = st.session_state.source_file_fingerprint or hashlib.sha256(file_bytes).hexdigest()
             selected_files = [{"name": file_name, "bytes": file_bytes, "fingerprint": fingerprint}]
-        else:
-            selected_files = []
 
     if process_clicked and selected_files:
         if not normalize_text(employee_id):
