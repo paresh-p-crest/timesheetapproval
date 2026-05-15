@@ -855,19 +855,6 @@ def normalize_with_bedrock(
     if cost_preview_holder is not None:
         cost_preview_holder.clear()
         cost_preview_holder.update(preview)
-    if _streamlit_script_active():
-        tag = f" ({source_label})" if source_label else ""
-        unit = preview.get("charge_unit", "USD")
-        total = preview.get("total_charge_est", preview.get("total_usd_est", 0.0))
-        unit_label = "USD" if unit == "USD" else "credits"
-        st.info(
-            f"Before LLM call{tag}: model `{preview['model_id']}` · "
-            f"~{preview['input_tokens_est']:,} input tokens · "
-            f"assuming {preview['output_tokens_assumed']:,} output tokens · "
-            f"estimated **{unit_label} {total:.4f}** total ({preview['pricing_profile']} · "
-            f"{preview['input_rate_per_mtok']:.4g}/{preview['output_rate_per_mtok']:.4g} per 1M {unit_label} in/out). "
-            f"Actual usage and provider charges may differ."
-        )
     msg = llm.invoke(prompt)
     if cost_preview_holder is not None:
         _merge_usage_from_llm_response(cost_preview_holder, getattr(msg, "response_metadata", None) or {})
