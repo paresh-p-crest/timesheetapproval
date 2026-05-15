@@ -4796,45 +4796,49 @@ def main() -> None:
                 learning_answer = "no"
                 learning_question_short = "day_hours_mismatch"
             else:
-                manual_outcome = st.selectbox("Outcome", ["APPROVE", "REJECT"], key="manual_outcome")
                 learning_answer = "yes"
-                if manual_outcome == "APPROVE":
-                    mismatch_keys = list((comparison.get("mismatches", {}) or {}).keys())
-                    question_map = {
-                        "employee_name": "Name does not match. Is this the same person?",
-                        "vendor": "Vendor does not match. Is this acceptable?",
-                        "company": "Company value is missing/mismatched. Is this acceptable for this employee/case?",
-                        "period_start": "Period start differs. Is this acceptable for this case?",
-                        "period_end": "Period end differs. Is this acceptable for this case?",
-                        "approved": "Approval signal is missing/mismatched. Is this acceptable?",
-                        "total_hours": "Total hours mismatch is present. Is this acceptable?",
-                    }
-                    per_mismatch_answers: List[str] = []
-                    asked_keys: List[str] = []
-                    for mk in mismatch_keys:
-                        q = question_map.get(mk, f"Mismatch in '{mk}'. Is this acceptable?")
-                        ans = st.radio(
-                            q,
-                            ["yes", "no"],
-                            horizontal=True,
-                            key=f"manual_learning_answer_{mk}",
-                        )
-                        asked_keys.append(mk)
-                        per_mismatch_answers.append(ans)
-                    if per_mismatch_answers:
-                        learning_answer = "yes" if all(x == "yes" for x in per_mismatch_answers) else "no"
-                        learning_question_short = f"mismatch:{','.join(sorted(set(asked_keys)))}"
-                    else:
-                        learning_answer = st.radio(
-                            "Is this mismatch pattern acceptable for this employee/case? (learned Yes/No)",
-                            ["yes", "no"],
-                            horizontal=True,
-                            key="manual_learning_answer",
-                        )
-                        learning_question_short = "general_mismatch"
-                    st.caption(f"Current learned streak for this pattern: {int(learned_streak)}")
+                mismatch_keys = list((comparison.get("mismatches", {}) or {}).keys())
+                question_map = {
+                    "employee_name": "Name does not match. Is this the same person?",
+                    "vendor": "Vendor does not match. Is this acceptable?",
+                    "company": "Company value is missing/mismatched. Is this acceptable for this employee/case?",
+                    "period_start": "Period start differs. Is this acceptable for this case?",
+                    "period_end": "Period end differs. Is this acceptable for this case?",
+                    "approved": "Approval signal is missing/mismatched. Is this acceptable?",
+                    "total_hours": "Total hours mismatch is present. Is this acceptable?",
+                }
+                per_mismatch_answers: List[str] = []
+                asked_keys: List[str] = []
+                for mk in mismatch_keys:
+                    q = question_map.get(mk, f"Mismatch in '{mk}'. Is this acceptable?")
+                    ans = st.radio(
+                        q,
+                        ["yes", "no"],
+                        horizontal=True,
+                        key=f"manual_learning_answer_{mk}",
+                    )
+                    asked_keys.append(mk)
+                    per_mismatch_answers.append(ans)
+                if per_mismatch_answers:
+                    learning_answer = "yes" if all(x == "yes" for x in per_mismatch_answers) else "no"
+                    learning_question_short = f"mismatch:{','.join(sorted(set(asked_keys)))}"
+                else:
+                    learning_answer = st.radio(
+                        "Is this mismatch pattern acceptable for this employee/case? (learned Yes/No)",
+                        ["yes", "no"],
+                        horizontal=True,
+                        key="manual_learning_answer",
+                    )
+                    learning_question_short = "general_mismatch"
+                st.caption(f"Current learned streak for this pattern: {int(learned_streak)}")
+                if learning_answer == "no":
+                    st.session_state["manual_outcome"] = "REJECT"
+                manual_outcome = st.selectbox("Outcome", ["APPROVE", "REJECT"], key="manual_outcome")
             manual_comment = st.text_area("Comment", key="manual_comment")
             if st.button("Submit Manual Decision"):
+                if manual_outcome == "APPROVE" and learning_answer == "no":
+                    st.error("Outcome cannot be Approve while any answer is 'no'. Change answers to yes or set Outcome to Reject.")
+                    return
                 if manual_outcome == "APPROVE":
                     new_streak = streak + 1
                     set_streak(employee_name, vendor, company, t_hash, p_key, new_streak)
